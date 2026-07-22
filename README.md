@@ -20,7 +20,7 @@
 | 環境 | 指令 |
 |------|------|
 | **Linux / macOS / Git Bash** | `./start.sh` |
-| **Windows** | 雙擊 `start.bat`，或在終端機執行 `start.bat` |
+| **Windows CMD / 雙擊** | `start.bat`（請用雙擊，或在專案目錄執行 `start.bat`） |
 
 腳本會自動：
 1. 檢查 Node / npm  

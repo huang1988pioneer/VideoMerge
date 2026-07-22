@@ -1,47 +1,51 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo.
-echo   VideoMerge 本機啟動
-echo   --------------------
+echo   VideoMerge local dev server
+echo   ---------------------------
 echo.
 
-where node >nul 2>&1
+where node >nul 2>nul
 if errorlevel 1 (
-  echo [錯誤] 找不到 Node.js。請先安裝：https://nodejs.org/
+  echo [ERROR] Node.js not found. Install from https://nodejs.org/
   pause
   exit /b 1
 )
 
-where npm >nul 2>&1
+where npm >nul 2>nul
 if errorlevel 1 (
-  echo [錯誤] 找不到 npm。請確認 Node.js 安裝完整。
+  echo [ERROR] npm not found. Reinstall Node.js.
   pause
   exit /b 1
 )
 
-for /f "tokens=*" %%v in ('node -v') do echo [OK] Node %%v
+for /f "delims=" %%v in ('node -v') do echo [OK] Node %%v
 
 if not exist "node_modules\" (
-  echo [→] 尚未安裝依賴，正在執行 npm install…
-  call npm install
+  echo [..] Running npm install ...
+  call npm.cmd install
   if errorlevel 1 (
-    echo [錯誤] npm install 失敗
+    echo [ERROR] npm install failed.
     pause
     exit /b 1
   )
-  echo [OK] 依賴安裝完成
+  echo [OK] Dependencies installed.
 ) else (
-  echo [OK] 依賴已就緒
+  echo [OK] Dependencies ready.
 )
 
-if "%PORT%"=="" set PORT=5173
+if not defined PORT set "PORT=5173"
 
-echo [→] 啟動開發伺服器（http://localhost:%PORT%/）
-echo [→] 按 Ctrl+C 可停止
+echo [..] Starting http://localhost:%PORT%/
+echo [..] Press Ctrl+C to stop.
 echo.
 
-call npm run dev -- --host 127.0.0.1 --port %PORT% --open
-if errorlevel 1 pause
-endlocal
+call npm.cmd run dev -- --host 127.0.0.1 --port %PORT% --open
+set "EXITCODE=%ERRORLEVEL%"
+if not "%EXITCODE%"=="0" (
+  echo [ERROR] Dev server exited with code %EXITCODE%.
+  pause
+)
+exit /b %EXITCODE%
