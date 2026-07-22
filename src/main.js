@@ -71,6 +71,10 @@ app.innerHTML = `
       <div class="toolbar">
         <button type="button" class="btn btn-ghost" id="btn-add-more">再加入影片</button>
         <button type="button" class="btn btn-danger" id="btn-clear" disabled>清除全部</button>
+        <label class="opt-check" for="opt-no-audio" title="合併時移除所有音軌">
+          <input type="checkbox" id="opt-no-audio" />
+          <span>不要聲音</span>
+        </label>
         <div class="toolbar-spacer"></div>
         <button type="button" class="btn btn-primary" id="btn-merge" disabled>
           合併為一個影片
@@ -124,6 +128,7 @@ const els = {
   btnAddMore: document.getElementById('btn-add-more'),
   btnClear: document.getElementById('btn-clear'),
   btnMerge: document.getElementById('btn-merge'),
+  optNoAudio: document.getElementById('opt-no-audio'),
   clipsRoot: document.getElementById('clips-root'),
   clipsCount: document.getElementById('clips-count'),
   progressBlock: document.getElementById('progress-block'),
@@ -190,6 +195,7 @@ function updateToolbar() {
   els.btnMerge.disabled = ready.length === 0 || merging || clips.some((c) => c.status === 'loading');
   els.btnAddMore.disabled = merging;
   els.fileInput.disabled = merging;
+  els.optNoAudio.disabled = merging;
 
   if (!hasClips) {
     els.clipsCount.textContent = '尚未加入影片';
@@ -400,9 +406,11 @@ async function runMerge() {
       }
     }
 
+    const noAudio = Boolean(els.optNoAudio.checked);
     const blob = await mergeVideos(
       ready.map((c) => c.file),
       {
+        noAudio,
         onStatus: (s) => setProgress(undefined, s),
         onProgress: (p) => {
           if (typeof p === 'number' && Number.isFinite(p)) {

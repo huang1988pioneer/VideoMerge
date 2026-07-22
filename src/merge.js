@@ -124,30 +124,40 @@ async function execOrThrow(ff, args, onLog) {
 }
 
 /**
- * Normalize one clip to H.264/AAC 1280x720 @ 30fps.
+ * Normalize one clip to H.264 1280x720 @ 30fps (optional AAC audio).
  * @param {FFmpeg} ff
  * @param {string} input
  * @param {string} output
- * @param {(msg: string) => void} [onLog]
+ * @param {{ noAudio?: boolean, onLog?: (msg: string) => void }} [opts]
  */
-async function normalizeClip(ff, input, output, onLog) {
+async function normalizeClip(ff, input, output, opts = {}) {
+  const { noAudio = false, onLog } = opts;
   const vf =
     'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p';
+
+  const videoArgs = [
+    '-i',
+    input,
+    '-vf',
+    vf,
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '23',
+  ];
+
+  if (noAudio) {
+    await execOrThrow(ff, [...videoArgs, '-an', '-y', output], onLog);
+    return;
+  }
 
   try {
     await execOrThrow(
       ff,
       [
-        '-i',
-        input,
-        '-vf',
-        vf,
-        '-c:v',
-        'libx264',
-        '-preset',
-        'ultrafast',
-        '-crf',
-        '23',
+        ...videoArgs,
         '-c:a',
         'aac',
         '-ar',
@@ -164,25 +174,7 @@ async function normalizeClip(ff, input, output, onLog) {
     );
   } catch (err) {
     onLog?.(`含音訊轉檔失敗，改為純影像：${err?.message || err}`);
-    await execOrThrow(
-      ff,
-      [
-        '-i',
-        input,
-        '-vf',
-        vf,
-        '-c:v',
-        'libx264',
-        '-preset',
-        'ultrafast',
-        '-crf',
-        '23',
-        '-an',
-        '-y',
-        output,
-      ],
-      onLog,
-    );
+    await execOrThrow(ff, [...videoArgs, '-an', '-y', output], onLog);
   }
 }
 
@@ -190,6 +182,7 @@ async function normalizeClip(ff, input, output, onLog) {
  * Merge multiple video Files into one MP4 Blob.
  * @param {File[]} files
  * @param {{
+ *   noAudio?: boolean,
  *   onLog?: (msg: string) => void,
  *   onProgress?: (ratio: number) => void,
  *   onStatus?: (status: string) => void,
@@ -199,8 +192,10 @@ async function normalizeClip(ff, input, output, onLog) {
 export async function mergeVideos(files, hooks = {}) {
   if (!files?.length) throw new Error('請至少選擇一段影片');
 
-  const { onLog, onProgress, onStatus } = hooks;
+  const { onLog, onProgress, onStatus, noAudio = false } = hooks;
   const ff = await ensureFFmpeg(onLog, onProgress);
+
+  if (noAudio) onLog?.('選項：不要聲音（輸出無音軌）');
 
   const written = [];
   try {
@@ -219,15 +214,15 @@ export async function mergeVideos(files, hooks = {}) {
     }
 
     if (files.length === 1) {
-      onStatus?.('轉檔中…');
-      await normalizeClip(ff, written[0], 'output.mp4', onLog);
+      onStatus?.(noAudio ? '轉檔中（無聲音）…' : '轉檔中…');
+      await normalizeClip(ff, written[0], 'output.mp4', { noAudio, onLog });
     } else {
       const normalized = [];
       const inputCount = files.length;
       for (let i = 0; i < inputCount; i++) {
-        onStatus?.(`標準化第 ${i + 1} / ${inputCount} 段…`);
+        onStatus?.(`標準化第 ${i + 1} / ${inputCount} 段${noAudio ? '（無聲音）' : ''}…`);
         const out = `norm${i}.mp4`;
-        await normalizeClip(ff, written[i], out, onLog);
+        await normalizeClip(ff, written[i], out, { noAudio, onLog });
         normalized.push(out);
         written.push(out);
       }
