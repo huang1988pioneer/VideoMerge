@@ -1,6 +1,6 @@
 import './style.css';
 import { extractFrames, formatBytes, formatDuration } from './frames.js';
-import { mergeVideos } from './merge.js';
+import { LOOP_LIMITS, mergeVideos } from './merge.js';
 
 /** @typedef {{
  *   id: string,
@@ -80,6 +80,64 @@ app.innerHTML = `
           合併為一個影片
         </button>
       </div>
+
+      <div class="extend-panel" aria-labelledby="extend-title">
+        <div class="extend-head">
+          <h3 id="extend-title">延長 / 循環</h3>
+          <p class="hint" id="extend-estimate">可依次數或目標時長自動重複並裁切</p>
+        </div>
+
+        <div class="extend-modes" role="radiogroup" aria-label="延長方式">
+          <label class="mode-chip">
+            <input type="radio" name="loop-mode" value="once" checked />
+            <span>播一次</span>
+          </label>
+          <label class="mode-chip">
+            <input type="radio" name="loop-mode" value="count" />
+            <span>重複次數</span>
+          </label>
+          <label class="mode-chip">
+            <input type="radio" name="loop-mode" value="duration" />
+            <span>目標時長</span>
+          </label>
+        </div>
+
+        <div class="extend-fields" id="extend-fields-count" hidden>
+          <label class="field" for="loop-count">
+            <span class="field-label">重複幾次（整段序列）</span>
+            <input
+              type="number"
+              id="loop-count"
+              min="1"
+              max="${LOOP_LIMITS.maxCount}"
+              value="2"
+              step="1"
+              inputmode="numeric"
+            />
+          </label>
+          <p class="field-hint">例如 3 = 依序播完整段合併結果共 3 遍</p>
+        </div>
+
+        <div class="extend-fields" id="extend-fields-duration" hidden>
+          <div class="field-row">
+            <label class="field" for="loop-hours">
+              <span class="field-label">時</span>
+              <input type="number" id="loop-hours" min="0" max="2" value="0" step="1" inputmode="numeric" />
+            </label>
+            <label class="field" for="loop-mins">
+              <span class="field-label">分</span>
+              <input type="number" id="loop-mins" min="0" max="59" value="1" step="1" inputmode="numeric" />
+            </label>
+            <label class="field" for="loop-secs">
+              <span class="field-label">秒</span>
+              <input type="number" id="loop-secs" min="0" max="59" value="0" step="1" inputmode="numeric" />
+            </label>
+          </div>
+          <p class="field-hint">
+            會自動循環整段內容，再裁切到目標時長（上限 ${LOOP_LIMITS.maxDurationSec / 3600} 小時）
+          </p>
+        </div>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="clips-title">
@@ -129,6 +187,13 @@ const els = {
   btnClear: document.getElementById('btn-clear'),
   btnMerge: document.getElementById('btn-merge'),
   optNoAudio: document.getElementById('opt-no-audio'),
+  loopCount: document.getElementById('loop-count'),
+  loopHours: document.getElementById('loop-hours'),
+  loopMins: document.getElementById('loop-mins'),
+  loopSecs: document.getElementById('loop-secs'),
+  extendFieldsCount: document.getElementById('extend-fields-count'),
+  extendFieldsDuration: document.getElementById('extend-fields-duration'),
+  extendEstimate: document.getElementById('extend-estimate'),
   clipsRoot: document.getElementById('clips-root'),
   clipsCount: document.getElementById('clips-count'),
   progressBlock: document.getElementById('progress-block'),
@@ -144,6 +209,79 @@ const els = {
   toastRegion: document.getElementById('toast-region'),
   headerMeta: document.getElementById('header-meta'),
 };
+
+function getLoopMode() {
+  const el = document.querySelector('input[name="loop-mode"]:checked');
+  return el?.value || 'once';
+}
+
+function getTargetSecondsFromFields() {
+  const h = Math.max(0, Math.floor(Number(els.loopHours.value) || 0));
+  const m = Math.max(0, Math.floor(Number(els.loopMins.value) || 0));
+  const s = Math.max(0, Math.floor(Number(els.loopSecs.value) || 0));
+  return h * 3600 + m * 60 + s;
+}
+
+function baseSequenceDuration() {
+  return clips
+    .filter((c) => c.status === 'ready')
+    .reduce((sum, c) => sum + (c.duration || 0), 0);
+}
+
+/** @returns {{ mode: 'once' | 'count' | 'duration', count?: number, targetSeconds?: number, baseDurationSec?: number }} */
+function getLoopOptions() {
+  const mode = getLoopMode();
+  const baseDurationSec = baseSequenceDuration();
+  if (mode === 'count') {
+    const count = Math.floor(Number(els.loopCount.value) || 1);
+    return { mode: 'count', count, baseDurationSec };
+  }
+  if (mode === 'duration') {
+    return {
+      mode: 'duration',
+      targetSeconds: getTargetSecondsFromFields(),
+      baseDurationSec,
+    };
+  }
+  return { mode: 'once', baseDurationSec };
+}
+
+function syncExtendUI() {
+  const mode = getLoopMode();
+  els.extendFieldsCount.hidden = mode !== 'count';
+  els.extendFieldsDuration.hidden = mode !== 'duration';
+
+  const base = baseSequenceDuration();
+  const baseLabel = base > 0 ? formatDuration(base) : '—';
+
+  if (mode === 'once') {
+    els.extendEstimate.textContent =
+      base > 0 ? `輸出約 ${baseLabel}（播一次）` : '可依次數或目標時長自動重複並裁切';
+    return;
+  }
+
+  if (mode === 'count') {
+    const count = Math.max(1, Math.floor(Number(els.loopCount.value) || 1));
+    const out = base > 0 ? base * count : 0;
+    els.extendEstimate.textContent =
+      base > 0
+        ? `基底 ${baseLabel} × ${count} 次 ≈ ${formatDuration(out)}`
+        : `將重複整段序列 ${count} 次`;
+    return;
+  }
+
+  const target = getTargetSecondsFromFields();
+  if (target <= 0) {
+    els.extendEstimate.textContent = '請設定目標時長（時 / 分 / 秒）';
+    return;
+  }
+  if (base > 0) {
+    const loops = Math.ceil(target / base);
+    els.extendEstimate.textContent = `基底 ${baseLabel} → 循環約 ${loops} 次，裁切至 ${formatDuration(target)}`;
+  } else {
+    els.extendEstimate.textContent = `目標時長 ${formatDuration(target)}（加入影片後可預估循環次數）`;
+  }
+}
 
 function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -197,6 +335,13 @@ function updateToolbar() {
   els.fileInput.disabled = merging;
   els.optNoAudio.disabled = merging;
 
+  const loopInputs = document.querySelectorAll(
+    'input[name="loop-mode"], #loop-count, #loop-hours, #loop-mins, #loop-secs',
+  );
+  loopInputs.forEach((el) => {
+    el.disabled = merging;
+  });
+
   if (!hasClips) {
     els.clipsCount.textContent = '尚未加入影片';
   } else {
@@ -207,6 +352,8 @@ function updateToolbar() {
   els.headerMeta.textContent = hasClips
     ? `${clips.length} 個檔案 · 本機處理`
     : '本機處理 · 不上傳伺服器';
+
+  syncExtendUI();
 }
 
 function renderClips() {
@@ -407,10 +554,29 @@ async function runMerge() {
     }
 
     const noAudio = Boolean(els.optNoAudio.checked);
+    const loop = getLoopOptions();
+
+    if (loop.mode === 'count') {
+      if (loop.count < 1 || loop.count > LOOP_LIMITS.maxCount) {
+        throw new Error(`重複次數請介於 1～${LOOP_LIMITS.maxCount}`);
+      }
+    }
+    if (loop.mode === 'duration') {
+      if (!loop.targetSeconds || loop.targetSeconds <= 0) {
+        throw new Error('請設定大於 0 的目標時長');
+      }
+      if (loop.targetSeconds > LOOP_LIMITS.maxDurationSec) {
+        throw new Error(
+          `目標時長不可超過 ${LOOP_LIMITS.maxDurationSec / 3600} 小時`,
+        );
+      }
+    }
+
     const blob = await mergeVideos(
       ready.map((c) => c.file),
       {
         noAudio,
+        loop,
         onStatus: (s) => setProgress(undefined, s),
         onProgress: (p) => {
           if (typeof p === 'number' && Number.isFinite(p)) {
@@ -453,6 +619,16 @@ els.btnAddMore.addEventListener('click', () => els.fileInput.click());
 els.btnClear.addEventListener('click', clearAll);
 els.btnMerge.addEventListener('click', runMerge);
 els.btnDismissResult.addEventListener('click', revokeResult);
+
+document.querySelectorAll('input[name="loop-mode"]').forEach((el) => {
+  el.addEventListener('change', syncExtendUI);
+});
+['input', 'change'].forEach((evt) => {
+  els.loopCount.addEventListener(evt, syncExtendUI);
+  els.loopHours.addEventListener(evt, syncExtendUI);
+  els.loopMins.addEventListener(evt, syncExtendUI);
+  els.loopSecs.addEventListener(evt, syncExtendUI);
+});
 
 ['dragenter', 'dragover'].forEach((type) => {
   els.dropzone.addEventListener(type, (e) => {

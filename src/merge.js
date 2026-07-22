@@ -178,11 +178,258 @@ async function normalizeClip(ff, input, output, opts = {}) {
   }
 }
 
+/** Soft limits to avoid browser OOM (still effectively “extend as needed”). */
+export const LOOP_LIMITS = {
+  maxCount: 999,
+  maxDurationSec: 2 * 60 * 60, // 2 hours
+};
+
+/**
+ * Concat multiple MEMFS files into one (stream copy).
+ * @param {FFmpeg} ff
+ * @param {string[]} names
+ * @param {string} output
+ * @param {(msg: string) => void} [onLog]
+ * @param {string[]} written
+ */
+async function concatCopy(ff, names, output, onLog, written) {
+  if (names.length === 1) {
+    // Copy single file to output name via remux
+    await execOrThrow(
+      ff,
+      ['-i', names[0], '-c', 'copy', '-movflags', '+faststart', '-y', output],
+      onLog,
+    );
+    return;
+  }
+  const listName = `list_${Date.now().toString(36)}.txt`;
+  const listBody = `${names.map((n) => `file ${n}`).join('\n')}\n`;
+  await ff.writeFile(listName, listBody);
+  written.push(listName);
+  await execOrThrow(
+    ff,
+    [
+      '-f',
+      'concat',
+      '-safe',
+      '0',
+      '-i',
+      listName,
+      '-c',
+      'copy',
+      '-movflags',
+      '+faststart',
+      '-y',
+      output,
+    ],
+    onLog,
+  );
+}
+
+/**
+ * Loop base clip by count and/or trim to target duration.
+ * @param {FFmpeg} ff
+ * @param {string} baseName
+ * @param {{
+ *   mode: 'once' | 'count' | 'duration',
+ *   count?: number,
+ *   targetSeconds?: number,
+ *   baseDurationSec?: number,
+ * }} loop
+ * @param {(msg: string) => void} [onLog]
+ * @param {(status: string) => void} [onStatus]
+ * @param {string[]} written
+ */
+/**
+ * Encode args for trim/loop re-encode (respect noAudio).
+ * @param {boolean} noAudio
+ */
+function reencodeTailArgs(noAudio) {
+  const args = [
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '23',
+    '-pix_fmt',
+    'yuv420p',
+  ];
+  if (noAudio) {
+    args.push('-an');
+  } else {
+    args.push('-c:a', 'aac', '-b:a', '128k');
+  }
+  args.push('-movflags', '+faststart', '-y', 'output.mp4');
+  return args;
+}
+
+/**
+ * @param {FFmpeg} ff
+ * @param {string} baseName
+ * @param {{
+ *   mode: 'once' | 'count' | 'duration',
+ *   count?: number,
+ *   targetSeconds?: number,
+ *   baseDurationSec?: number,
+ *   noAudio?: boolean,
+ * }} loop
+ * @param {(msg: string) => void} [onLog]
+ * @param {(status: string) => void} [onStatus]
+ * @param {string[]} written
+ */
+async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
+  const mode = loop?.mode || 'once';
+  const noAudio = Boolean(loop?.noAudio);
+
+  if (mode === 'once') {
+    if (baseName === 'output.mp4') return;
+    await execOrThrow(
+      ff,
+      ['-i', baseName, '-c', 'copy', '-movflags', '+faststart', '-y', 'output.mp4'],
+      onLog,
+    );
+    return;
+  }
+
+  if (mode === 'count') {
+    const count = Math.floor(Number(loop.count) || 1);
+    if (count < 1) throw new Error('重複次數至少為 1');
+    if (count > LOOP_LIMITS.maxCount) {
+      throw new Error(`重複次數上限為 ${LOOP_LIMITS.maxCount}`);
+    }
+    if (count === 1) {
+      await applyLoopExtend(
+        ff,
+        baseName,
+        { mode: 'once', noAudio },
+        onLog,
+        onStatus,
+        written,
+      );
+      return;
+    }
+
+    onStatus?.(`循環延長：重複 ${count} 次…`);
+    onLog?.(`stream_loop extra=${count - 1}（總播放 ${count} 次）`);
+
+    try {
+      // -stream_loop N means N additional loops (total plays = N+1)
+      await execOrThrow(
+        ff,
+        [
+          '-stream_loop',
+          String(count - 1),
+          '-i',
+          baseName,
+          '-c',
+          'copy',
+          '-movflags',
+          '+faststart',
+          '-y',
+          'output.mp4',
+        ],
+        onLog,
+      );
+    } catch (err) {
+      onLog?.(`stream_loop 失敗，改用 concat 清單：${err?.message || err}`);
+      const names = Array.from({ length: count }, () => baseName);
+      await concatCopy(ff, names, 'output.mp4', onLog, written);
+    }
+    return;
+  }
+
+  if (mode === 'duration') {
+    const target = Number(loop.targetSeconds);
+    if (!Number.isFinite(target) || target <= 0) {
+      throw new Error('請輸入有效的目標時長（秒）');
+    }
+    if (target > LOOP_LIMITS.maxDurationSec) {
+      throw new Error(
+        `目標時長上限為 ${LOOP_LIMITS.maxDurationSec / 3600} 小時（${LOOP_LIMITS.maxDurationSec} 秒）`,
+      );
+    }
+
+    const baseDur = Number(loop.baseDurationSec);
+    if (Number.isFinite(baseDur) && baseDur > 0 && target <= baseDur + 0.05) {
+      onStatus?.(`裁切至 ${target.toFixed(1)} 秒…`);
+      await execOrThrow(
+        ff,
+        [
+          '-i',
+          baseName,
+          '-t',
+          target.toFixed(3),
+          ...reencodeTailArgs(noAudio),
+        ],
+        onLog,
+      );
+      return;
+    }
+
+    onStatus?.(`循環延長並裁切至 ${formatSec(target)}…`);
+    onLog?.(`stream_loop -1 + -t ${target}`);
+
+    try {
+      await execOrThrow(
+        ff,
+        [
+          '-stream_loop',
+          '-1',
+          '-i',
+          baseName,
+          '-t',
+          target.toFixed(3),
+          ...reencodeTailArgs(noAudio),
+        ],
+        onLog,
+      );
+    } catch (err) {
+      onLog?.(`stream_loop 時長模式失敗，改用重複 concat：${err?.message || err}`);
+      const unit = Number.isFinite(baseDur) && baseDur > 0 ? baseDur : target;
+      const times = Math.max(1, Math.ceil(target / unit));
+      if (times > LOOP_LIMITS.maxCount) {
+        throw new Error(
+          `依時長推算需重複 ${times} 次，超過上限 ${LOOP_LIMITS.maxCount}。請縮短目標時長。`,
+        );
+      }
+      const names = Array.from({ length: times }, () => baseName);
+      const looped = 'looped_tmp.mp4';
+      await concatCopy(ff, names, looped, onLog, written);
+      written.push(looped);
+      await execOrThrow(
+        ff,
+        ['-i', looped, '-t', target.toFixed(3), ...reencodeTailArgs(noAudio)],
+        onLog,
+      );
+    }
+    return;
+  }
+
+  throw new Error(`未知的延長模式：${mode}`);
+}
+
+function formatSec(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  if (h > 0) return `${h}:${pad(m)}:${pad(r)}`;
+  return `${m}:${pad(r)}`;
+}
+
 /**
  * Merge multiple video Files into one MP4 Blob.
  * @param {File[]} files
  * @param {{
  *   noAudio?: boolean,
+ *   loop?: {
+ *     mode: 'once' | 'count' | 'duration',
+ *     count?: number,
+ *     targetSeconds?: number,
+ *     baseDurationSec?: number,
+ *   },
  *   onLog?: (msg: string) => void,
  *   onProgress?: (ratio: number) => void,
  *   onStatus?: (status: string) => void,
@@ -192,10 +439,17 @@ async function normalizeClip(ff, input, output, opts = {}) {
 export async function mergeVideos(files, hooks = {}) {
   if (!files?.length) throw new Error('請至少選擇一段影片');
 
-  const { onLog, onProgress, onStatus, noAudio = false } = hooks;
+  const { onLog, onProgress, onStatus, noAudio = false, loop = { mode: 'once' } } = hooks;
   const ff = await ensureFFmpeg(onLog, onProgress);
 
   if (noAudio) onLog?.('選項：不要聲音（輸出無音軌）');
+  if (loop?.mode && loop.mode !== 'once') {
+    onLog?.(
+      `選項：延長模式=${loop.mode}` +
+        (loop.mode === 'count' ? ` count=${loop.count}` : '') +
+        (loop.mode === 'duration' ? ` target=${loop.targetSeconds}s` : ''),
+    );
+  }
 
   const written = [];
   try {
@@ -213,49 +467,54 @@ export async function mergeVideos(files, hooks = {}) {
       onLog?.(`已寫入 MEMFS：${name}`);
     }
 
-    if (files.length === 1) {
-      onStatus?.(noAudio ? '轉檔中（無聲音）…' : '轉檔中…');
-      await normalizeClip(ff, written[0], 'output.mp4', { noAudio, onLog });
+    const needsLoop = loop?.mode && loop.mode !== 'once';
+    const baseName = 'base.mp4';
+
+    // 1) Normalize every input to shared format
+    const normalized = [];
+    const inputCount = files.length;
+    for (let i = 0; i < inputCount; i++) {
+      onStatus?.(
+        `標準化第 ${i + 1} / ${inputCount} 段${noAudio ? '（無聲音）' : ''}…`,
+      );
+      const out = `norm${i}.mp4`;
+      await normalizeClip(ff, written[i], out, { noAudio, onLog });
+      normalized.push(out);
+      written.push(out);
+    }
+
+    // 2) Build base sequence (one pass of all clips in order)
+    if (normalized.length === 1) {
+      onStatus?.('準備基底片段…');
+      await concatCopy(ff, normalized, baseName, onLog, written);
     } else {
-      const normalized = [];
-      const inputCount = files.length;
-      for (let i = 0; i < inputCount; i++) {
-        onStatus?.(`標準化第 ${i + 1} / ${inputCount} 段${noAudio ? '（無聲音）' : ''}…`);
-        const out = `norm${i}.mp4`;
-        await normalizeClip(ff, written[i], out, { noAudio, onLog });
-        normalized.push(out);
-        written.push(out);
-      }
-
       onStatus?.('串接片段…');
-      // concat demuxer: no quotes needed inside MEMFS
-      const listBody = `${normalized.map((n) => `file ${n}`).join('\n')}\n`;
-      await ff.writeFile('list.txt', listBody);
-      written.push('list.txt');
+      await concatCopy(ff, normalized, baseName, onLog, written);
+    }
+    written.push(baseName);
 
+    // 3) Optional loop / duration trim → output.mp4
+    if (needsLoop) {
+      await applyLoopExtend(
+        ff,
+        baseName,
+        { ...loop, noAudio },
+        onLog,
+        onStatus,
+        written,
+      );
+    } else {
+      onStatus?.(noAudio ? '輸出中（無聲音）…' : '輸出中…');
       await execOrThrow(
         ff,
-        [
-          '-f',
-          'concat',
-          '-safe',
-          '0',
-          '-i',
-          'list.txt',
-          '-c',
-          'copy',
-          '-movflags',
-          '+faststart',
-          '-y',
-          'output.mp4',
-        ],
+        ['-i', baseName, '-c', 'copy', '-movflags', '+faststart', '-y', 'output.mp4'],
         onLog,
       );
     }
+    written.push('output.mp4');
 
     onStatus?.('讀取結果…');
     const data = await ff.readFile('output.mp4');
-    written.push('output.mp4');
 
     const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
     if (!u8.byteLength) {
