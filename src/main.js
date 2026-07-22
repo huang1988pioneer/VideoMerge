@@ -21,6 +21,8 @@ let clips = [];
 let merging = false;
 /** @type {string | null} */
 let resultUrl = null;
+/** @type {File | null} */
+let audioFile = null;
 
 const app = document.querySelector('#app');
 
@@ -138,6 +140,27 @@ app.innerHTML = `
           </p>
         </div>
       </div>
+
+      <div class="audio-panel" aria-labelledby="audio-title">
+        <div class="extend-head">
+          <h3 id="audio-title">自訂音軌</h3>
+          <p class="hint" id="audio-hint">可選 MP3 當作影片聲音（取代原音）</p>
+        </div>
+        <div class="audio-row">
+          <input
+            type="file"
+            id="audio-input"
+            accept="audio/mpeg,audio/mp3,audio/wav,audio/x-m4a,audio/mp4,audio/aac,audio/*"
+            hidden
+          />
+          <button type="button" class="btn btn-ghost" id="btn-pick-audio">選擇 MP3</button>
+          <button type="button" class="btn btn-danger btn-sm" id="btn-clear-audio" disabled>清除</button>
+          <span class="audio-name" id="audio-name">未選擇音訊</span>
+        </div>
+        <p class="field-hint">
+          勾選「不要聲音」時會忽略此音軌。音訊比影片短會循環，比影片長則裁到影片長度。
+        </p>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="clips-title">
@@ -194,6 +217,11 @@ const els = {
   extendFieldsCount: document.getElementById('extend-fields-count'),
   extendFieldsDuration: document.getElementById('extend-fields-duration'),
   extendEstimate: document.getElementById('extend-estimate'),
+  audioInput: document.getElementById('audio-input'),
+  btnPickAudio: document.getElementById('btn-pick-audio'),
+  btnClearAudio: document.getElementById('btn-clear-audio'),
+  audioName: document.getElementById('audio-name'),
+  audioHint: document.getElementById('audio-hint'),
   clipsRoot: document.getElementById('clips-root'),
   clipsCount: document.getElementById('clips-count'),
   progressBlock: document.getElementById('progress-block'),
@@ -257,30 +285,77 @@ function syncExtendUI() {
   if (mode === 'once') {
     els.extendEstimate.textContent =
       base > 0 ? `輸出約 ${baseLabel}` : '選擇重複次數或目標時長可自動延長';
-    return;
-  }
-
-  if (mode === 'count') {
+  } else if (mode === 'count') {
     const count = Math.max(1, Math.floor(Number(els.loopCount.value) || 1));
     const out = base > 0 ? base * count : 0;
     els.extendEstimate.textContent =
       base > 0
         ? `基底 ${baseLabel} × ${count} 次 ≈ ${formatDuration(out)}`
         : `將重複整段序列 ${count} 次`;
-    return;
+  } else {
+    const target = getTargetSecondsFromFields();
+    if (target <= 0) {
+      els.extendEstimate.textContent = '請設定目標時長（時 / 分 / 秒）';
+    } else if (base > 0) {
+      const loops = Math.ceil(target / base);
+      els.extendEstimate.textContent = `基底 ${baseLabel} → 循環約 ${loops} 次，裁切至 ${formatDuration(target)}`;
+    } else {
+      els.extendEstimate.textContent = `目標時長 ${formatDuration(target)}（加入影片後可預估循環次數）`;
+    }
   }
 
-  const target = getTargetSecondsFromFields();
-  if (target <= 0) {
-    els.extendEstimate.textContent = '請設定目標時長（時 / 分 / 秒）';
+  syncAudioUI();
+}
+
+function syncAudioUI() {
+  const muted = Boolean(els.optNoAudio.checked);
+  if (audioFile) {
+    els.audioName.textContent = audioFile.name;
+    els.audioName.title = audioFile.name;
+    els.btnClearAudio.disabled = merging;
+    els.audioHint.textContent = muted
+      ? '已選音軌，但「不要聲音」開啟中，輸出將無聲'
+      : `已選：${audioFile.name}（將取代原影片聲音）`;
+  } else {
+    els.audioName.textContent = '未選擇音訊';
+    els.audioName.title = '';
+    els.btnClearAudio.disabled = true;
+    els.audioHint.textContent = muted
+      ? '「不要聲音」已開啟'
+      : '可選 MP3 當作影片聲音（取代原音）';
+  }
+
+  els.btnPickAudio.disabled = merging || muted;
+  els.audioInput.disabled = merging || muted;
+}
+
+function setAudioFile(file) {
+  if (!file) {
+    audioFile = null;
+    syncAudioUI();
     return;
   }
-  if (base > 0) {
-    const loops = Math.ceil(target / base);
-    els.extendEstimate.textContent = `基底 ${baseLabel} → 循環約 ${loops} 次，裁切至 ${formatDuration(target)}`;
-  } else {
-    els.extendEstimate.textContent = `目標時長 ${formatDuration(target)}（加入影片後可預估循環次數）`;
+  const okType =
+    file.type.startsWith('audio/') ||
+    /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(file.name);
+  if (!okType) {
+    toast('請選擇音訊檔（建議 MP3）', 'error');
+    return;
   }
+  audioFile = file;
+  if (els.optNoAudio.checked) {
+    els.optNoAudio.checked = false;
+    toast('已關閉「不要聲音」，以套用自訂音軌');
+  }
+  syncAudioUI();
+  toast(`已選擇音軌：${file.name}`, 'success');
+}
+
+function clearAudioFile(silent = false) {
+  audioFile = null;
+  if (els.audioInput) els.audioInput.value = '';
+  syncAudioUI();
+  if (!silent) toast('已清除自訂音軌');
 }
 
 function uid() {
@@ -341,6 +416,7 @@ function updateToolbar() {
   loopInputs.forEach((el) => {
     el.disabled = merging;
   });
+  syncAudioUI();
 
   if (!hasClips) {
     els.clipsCount.textContent = '尚未加入影片';
@@ -523,6 +599,7 @@ function removeClip(id) {
 function clearAll() {
   if (merging) return;
   clips = [];
+  clearAudioFile(true);
   renderClips();
   revokeResult();
   els.progressBlock.classList.remove('is-visible');
@@ -555,6 +632,7 @@ async function runMerge() {
 
     const noAudio = Boolean(els.optNoAudio.checked);
     const loop = getLoopOptions();
+    const bgm = !noAudio && audioFile instanceof File ? audioFile : null;
 
     if (loop.mode === 'count') {
       if (loop.count < 1 || loop.count > LOOP_LIMITS.maxCount) {
@@ -576,6 +654,7 @@ async function runMerge() {
       ready.map((c) => c.file),
       {
         noAudio,
+        audioFile: bgm,
         loop,
         onStatus: (s) => setProgress(undefined, s),
         onProgress: (p) => {
@@ -619,6 +698,19 @@ els.btnAddMore.addEventListener('click', () => els.fileInput.click());
 els.btnClear.addEventListener('click', clearAll);
 els.btnMerge.addEventListener('click', runMerge);
 els.btnDismissResult.addEventListener('click', revokeResult);
+
+els.btnPickAudio.addEventListener('click', () => {
+  if (!els.optNoAudio.checked) els.audioInput.click();
+});
+els.btnClearAudio.addEventListener('click', clearAudioFile);
+els.audioInput.addEventListener('change', () => {
+  const f = els.audioInput.files?.[0];
+  if (f) setAudioFile(f);
+  els.audioInput.value = '';
+});
+els.optNoAudio.addEventListener('change', () => {
+  syncAudioUI();
+});
 
 document.querySelectorAll('input[name="loop-mode"]').forEach((el) => {
   el.addEventListener('change', syncExtendUI);

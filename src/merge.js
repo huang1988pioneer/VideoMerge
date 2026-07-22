@@ -420,10 +420,90 @@ function formatSec(sec) {
 }
 
 /**
+ * Replace video audio with a custom audio file (mp3 etc).
+ * Loops audio if shorter than video; trims to video length if longer.
+ * @param {FFmpeg} ff
+ * @param {string} videoName
+ * @param {string} audioName
+ * @param {string} output
+ * @param {(msg: string) => void} [onLog]
+ */
+async function muxCustomAudio(ff, videoName, audioName, output, onLog) {
+  // Prefer looped audio + shortest (video ends first → clean length)
+  try {
+    await execOrThrow(
+      ff,
+      [
+        '-i',
+        videoName,
+        '-stream_loop',
+        '-1',
+        '-i',
+        audioName,
+        '-map',
+        '0:v:0',
+        '-map',
+        '1:a:0',
+        '-c:v',
+        'copy',
+        '-c:a',
+        'aac',
+        '-ar',
+        '44100',
+        '-ac',
+        '2',
+        '-b:a',
+        '192k',
+        '-shortest',
+        '-movflags',
+        '+faststart',
+        '-y',
+        output,
+      ],
+      onLog,
+    );
+    return;
+  } catch (err) {
+    onLog?.(`循環音訊失敗，改試單次貼上：${err?.message || err}`);
+  }
+
+  await execOrThrow(
+    ff,
+    [
+      '-i',
+      videoName,
+      '-i',
+      audioName,
+      '-map',
+      '0:v:0',
+      '-map',
+      '1:a:0',
+      '-c:v',
+      'copy',
+      '-c:a',
+      'aac',
+      '-ar',
+      '44100',
+      '-ac',
+      '2',
+      '-b:a',
+      '192k',
+      '-shortest',
+      '-movflags',
+      '+faststart',
+      '-y',
+      output,
+    ],
+    onLog,
+  );
+}
+
+/**
  * Merge multiple video Files into one MP4 Blob.
  * @param {File[]} files
  * @param {{
  *   noAudio?: boolean,
+ *   audioFile?: File | null,
  *   loop?: {
  *     mode: 'once' | 'count' | 'duration',
  *     count?: number,
@@ -439,10 +519,24 @@ function formatSec(sec) {
 export async function mergeVideos(files, hooks = {}) {
   if (!files?.length) throw new Error('請至少選擇一段影片');
 
-  const { onLog, onProgress, onStatus, noAudio = false, loop = { mode: 'once' } } = hooks;
+  const {
+    onLog,
+    onProgress,
+    onStatus,
+    noAudio = false,
+    audioFile = null,
+    loop = { mode: 'once' },
+  } = hooks;
   const ff = await ensureFFmpeg(onLog, onProgress);
 
+  // Custom soundtrack replaces original audio; strip during normalize.
+  const useCustomAudio = Boolean(audioFile) && !noAudio;
+  const stripOriginalAudio = noAudio || useCustomAudio;
+
   if (noAudio) onLog?.('選項：不要聲音（輸出無音軌）');
+  if (useCustomAudio) {
+    onLog?.(`選項：自訂音軌 ${audioFile.name}（取代原影片聲音）`);
+  }
   if (loop?.mode && loop.mode !== 'once') {
     onLog?.(
       `選項：延長模式=${loop.mode}` +
@@ -467,6 +561,16 @@ export async function mergeVideos(files, hooks = {}) {
       onLog?.(`已寫入 MEMFS：${name}`);
     }
 
+    let audioMemName = null;
+    if (useCustomAudio) {
+      onStatus?.(`讀取音訊：${audioFile.name}`);
+      const audioBytes = await readBytes(audioFile);
+      audioMemName = `bgm.${extFromName(audioFile.name) || 'mp3'}`;
+      await ff.writeFile(audioMemName, audioBytes);
+      written.push(audioMemName);
+      onLog?.(`已寫入音訊：${audioMemName}（${audioFile.size} bytes）`);
+    }
+
     const needsLoop = loop?.mode && loop.mode !== 'once';
     const baseName = 'base.mp4';
 
@@ -475,43 +579,60 @@ export async function mergeVideos(files, hooks = {}) {
     const inputCount = files.length;
     for (let i = 0; i < inputCount; i++) {
       onStatus?.(
-        `標準化第 ${i + 1} / ${inputCount} 段${noAudio ? '（無聲音）' : ''}…`,
+        `標準化第 ${i + 1} / ${inputCount} 段${stripOriginalAudio ? '（無原音）' : ''}…`,
       );
       const out = `norm${i}.mp4`;
-      await normalizeClip(ff, written[i], out, { noAudio, onLog });
+      await normalizeClip(ff, written[i], out, {
+        noAudio: stripOriginalAudio,
+        onLog,
+      });
       normalized.push(out);
       written.push(out);
     }
 
     // 2) Build base sequence (one pass of all clips in order)
-    if (normalized.length === 1) {
-      onStatus?.('準備基底片段…');
-      await concatCopy(ff, normalized, baseName, onLog, written);
-    } else {
-      onStatus?.('串接片段…');
-      await concatCopy(ff, normalized, baseName, onLog, written);
-    }
+    onStatus?.(normalized.length === 1 ? '準備基底片段…' : '串接片段…');
+    await concatCopy(ff, normalized, baseName, onLog, written);
     written.push(baseName);
 
-    // 3) Optional loop / duration trim → output.mp4
+    // 3) Optional loop / duration trim → video-only or with original audio
+    // When custom audio is used, keep video silent until mux step.
+    const videoOut = useCustomAudio ? 'video_only.mp4' : 'output.mp4';
     if (needsLoop) {
       await applyLoopExtend(
         ff,
         baseName,
-        { ...loop, noAudio },
+        { ...loop, noAudio: stripOriginalAudio },
         onLog,
         onStatus,
         written,
       );
+      if (useCustomAudio) {
+        // applyLoopExtend always writes output.mp4 — rename for mux
+        await execOrThrow(
+          ff,
+          ['-i', 'output.mp4', '-c', 'copy', '-y', videoOut],
+          onLog,
+        );
+        written.push(videoOut);
+      }
     } else {
-      onStatus?.(noAudio ? '輸出中（無聲音）…' : '輸出中…');
+      onStatus?.(stripOriginalAudio ? '輸出影像中…' : '輸出中…');
       await execOrThrow(
         ff,
-        ['-i', baseName, '-c', 'copy', '-movflags', '+faststart', '-y', 'output.mp4'],
+        ['-i', baseName, '-c', 'copy', '-movflags', '+faststart', '-y', videoOut],
         onLog,
       );
+      written.push(videoOut);
     }
-    written.push('output.mp4');
+    if (!useCustomAudio) written.push('output.mp4');
+
+    // 4) Mux custom MP3 / audio as soundtrack
+    if (useCustomAudio && audioMemName) {
+      onStatus?.('套用自訂音軌（MP3）…');
+      await muxCustomAudio(ff, videoOut, audioMemName, 'output.mp4', onLog);
+      written.push('output.mp4');
+    }
 
     onStatus?.('讀取結果…');
     const data = await ff.readFile('output.mp4');
