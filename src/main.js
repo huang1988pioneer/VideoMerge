@@ -237,7 +237,7 @@ app.innerHTML = `
             />
           </label>
           <span class="field-hint script-sync-hint" id="offset-hint">
-            MP3 前奏音樂不上字幕；偵測到歌聲／人聲後才開始，可再手動微調。
+            開唱通常不是 0:00；會略過前奏樂器，從歌聲起點再上字幕（可手動微調）。
           </span>
         </div>
         <p class="field-hint">
