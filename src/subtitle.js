@@ -579,21 +579,24 @@ async function filterVocalBand(mono, sampleRate) {
 }
 
 /**
- * Per-frame vocal likelihood: mid-band energy + spectral flatness proxy.
- * Returns onset of sustained "voice-like" activity (singing / speech), not just any music.
+ * Per-frame vocal likelihood. Prefers first *real* singing entry — not 0:00
+ * instrumental energy. Music intros almost never start lyrics at 0:00.
+ *
  * @param {Float32Array} mono full-band
  * @param {Float32Array} vocal mono vocal-filtered
  * @param {number} sampleRate
- * @returns {{ onsetSec: number, endSec: number, peakRms: number, method: string }}
+ * @returns {{ onsetSec: number, endSec: number, peakRms: number, method: string, introSec: number }}
  */
 function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
   const frameMs = 40;
   const frameSize = Math.max(128, Math.floor((sampleRate * frameMs) / 1000));
   const hop = Math.floor(frameSize / 2);
   const nFrames = Math.max(1, Math.floor((mono.length - frameSize) / hop) + 1);
+  const durationSec = mono.length / sampleRate;
 
   const fullRms = new Float32Array(nFrames);
   const vocRms = new Float32Array(nFrames);
+  const ratio = new Float32Array(nFrames);
   let peakV = 0;
   let peakF = 0;
 
@@ -609,48 +612,167 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
     }
     fullRms[f] = Math.sqrt(sf / frameSize);
     vocRms[f] = Math.sqrt(sv / frameSize);
+    ratio[f] = fullRms[f] > 1e-6 ? vocRms[f] / fullRms[f] : 0;
     if (vocRms[f] > peakV) peakV = vocRms[f];
     if (fullRms[f] > peakF) peakF = fullRms[f];
   }
 
-  // Adaptive thresholds: need strong vocal-band presence relative to mix
+  // Global vocal peak often appears at chorus/verse — use as anchor strength
   const sortedV = Array.from(vocRms).sort((a, b) => a - b);
   const noiseV = sortedV[Math.floor(sortedV.length * 0.25)] || 0;
-  const thrV = Math.max(peakV * 0.18, noiseV * 6, 0.004);
+  const p75V = sortedV[Math.floor(sortedV.length * 0.75)] || peakV;
+  // Need clear vocal presence (not weak mid-band from guitars)
+  const thrV = Math.max(peakV * 0.22, p75V * 0.45, noiseV * 8, 0.005);
 
-  // Sustained singing ~ 250–400ms (not a snare hit)
-  const minRun = Math.max(4, Math.round(280 / frameMs));
-  // Vocal ratio: voice-band / full — instruments-only intros often have lower ratio mid-song vocals higher
-  const minRatio = 0.22;
+  // Sustained singing ≥ ~350ms (reject drum/synth blips)
+  const minRun = Math.max(6, Math.round(350 / frameMs));
+  const minRatio = 0.28;
 
-  let onsetFrame = -1;
-  for (let f = 0; f < nFrames; f++) {
+  // --- Estimate instrumental intro length ---
+  // Average vocal-ratio in early windows; low ratio + high energy = music bed
+  const introProbeSec = Math.min(12, durationSec * 0.35);
+  const introFrames = Math.max(1, Math.floor((introProbeSec * sampleRate) / hop));
+  let introScore = 0; // higher = more instrumental
+  let sumRatioEarly = 0;
+  let sumFullEarly = 0;
+  let nEarly = 0;
+  for (let f = 0; f < Math.min(introFrames, nFrames); f++) {
+    sumRatioEarly += ratio[f];
+    sumFullEarly += fullRms[f];
+    nEarly += 1;
+    if (fullRms[f] > peakF * 0.15 && ratio[f] < 0.25) introScore += 1;
+  }
+  const avgRatioEarly = nEarly ? sumRatioEarly / nEarly : 0;
+  const avgFullEarly = nEarly ? sumFullEarly / nEarly : 0;
+  const looksLikeIntro =
+    durationSec > 4 &&
+    avgFullEarly > peakF * 0.08 &&
+    (avgRatioEarly < 0.32 || introScore > introFrames * 0.35);
+
+  // Don't start search at 0:00 when intro looks instrumental
+  // Typical pop/ballad vocals enter after several seconds
+  let searchFromSec = 0;
+  if (looksLikeIntro) {
+    // Skip at least first 1.2s; extend while still "instrumental-like"
+    searchFromSec = 1.2;
+    for (let f = 0; f < nFrames; f++) {
+      const t = (f * hop) / sampleRate;
+      if (t < 1.2) continue;
+      if (t > 45) break; // safety
+      const r = ratio[f];
+      const instrumental = fullRms[f] > thrV * 0.3 && r < minRatio;
+      if (instrumental) searchFromSec = t;
+      else if (vocRms[f] >= thrV * 0.85 && r >= minRatio) break;
+    }
+    // Cap skip so we don't miss early vocals entirely
+    searchFromSec = Math.min(searchFromSec, Math.min(40, durationSec * 0.5));
+  }
+
+  const searchFromFrame = Math.floor((searchFromSec * sampleRate) / hop);
+
+  /**
+   * Score a candidate onset frame: higher = more confident singing entry
+   * @param {number} f
+   */
+  const scoreOnset = (f) => {
+    let s = 0;
+    for (let k = 0; k < minRun; k++) {
+      const i = f + k;
+      if (i >= nFrames) break;
+      if (vocRms[i] >= thrV && ratio[i] >= minRatio) {
+        s += vocRms[i] * (0.5 + ratio[i]);
+      }
+    }
+    // Bonus if this is a rise vs previous second (entry moment)
+    const prev = Math.max(0, f - Math.round(1000 / frameMs));
+    let prevAvg = 0;
+    let cnt = 0;
+    for (let i = prev; i < f; i++) {
+      prevAvg += vocRms[i];
+      cnt += 1;
+    }
+    prevAvg = cnt ? prevAvg / cnt : 0;
+    if (vocRms[f] > prevAvg * 1.6) s *= 1.35;
+    return s;
+  };
+
+  // Collect candidates after intro skip
+  /** @type {{ frame: number, score: number }[]} */
+  const candidates = [];
+  for (let f = searchFromFrame; f < nFrames; f++) {
     let ok = 0;
     for (let k = 0; k < minRun; k++) {
       const i = f + k;
       if (i >= nFrames) break;
-      const ratio = fullRms[i] > 1e-6 ? vocRms[i] / fullRms[i] : 0;
-      if (vocRms[i] >= thrV && ratio >= minRatio) ok += 1;
+      if (vocRms[i] >= thrV && ratio[i] >= minRatio) ok += 1;
     }
     if (ok >= minRun) {
-      onsetFrame = f;
-      break;
+      candidates.push({ frame: f, score: scoreOnset(f) });
+      // Skip ahead to avoid dense duplicates
+      f += minRun;
     }
   }
 
-  // Fallback: pure vocal-band energy (still better than full-band bass)
+  // Also scan from 0 with stricter bar (only accept 0:00 if clearly vocal-led)
+  if (searchFromFrame > 0) {
+    const strictRun = minRun + 2;
+    const thrStrict = thrV * 1.15;
+    for (let f = 0; f < searchFromFrame; f++) {
+      let ok = 0;
+      for (let k = 0; k < strictRun; k++) {
+        const i = f + k;
+        if (i >= nFrames) break;
+        if (vocRms[i] >= thrStrict && ratio[i] >= minRatio + 0.08) ok += 1;
+      }
+      if (ok >= strictRun) {
+        candidates.push({ frame: f, score: scoreOnset(f) * 1.1 });
+        break;
+      }
+    }
+  }
+
+  let onsetFrame = -1;
+  let method = 'vocal-ratio';
+
+  if (candidates.length) {
+    // Prefer earliest candidate that reaches at least 55% of best score
+    // (don't jump to chorus if verse vocals already clear)
+    const best = Math.max(...candidates.map((c) => c.score));
+    const good = candidates
+      .filter((c) => c.score >= best * 0.55)
+      .sort((a, b) => a.frame - b.frame);
+    onsetFrame = good[0].frame;
+    method = looksLikeIntro ? 'vocal-after-intro' : 'vocal-ratio';
+  }
+
+  // Fallback: vocal-band energy but never trust pure 0:00 on long tracks
   if (onsetFrame < 0) {
     const loose = detectSpeechBounds(vocal, sampleRate, {
-      frameMs: 35,
-      thresholdRatio: 0.16,
-      minRunFrames: Math.max(4, Math.round(250 / 35)),
+      frameMs: 40,
+      thresholdRatio: 0.2,
+      minRunFrames: Math.max(6, Math.round(320 / 40)),
+      minOnsetSec: looksLikeIntro ? Math.max(1.5, searchFromSec) : 0.25,
     });
     return {
       onsetSec: loose.onsetSec,
       endSec: loose.endSec,
       peakRms: peakV,
       method: 'vocal-band-energy',
+      introSec: searchFromSec,
     };
+  }
+
+  // Reject near-zero onset on music-like files unless early ratio is high
+  let onsetSec = (onsetFrame * hop) / sampleRate;
+  if (onsetSec < 0.5 && looksLikeIntro && candidates.length > 1) {
+    const later = candidates
+      .filter((c) => (c.frame * hop) / sampleRate >= 0.8)
+      .sort((a, b) => a.frame - b.frame);
+    if (later.length && later[0].score >= candidates[0].score * 0.5) {
+      onsetFrame = later[0].frame;
+      onsetSec = (onsetFrame * hop) / sampleRate;
+      method = 'vocal-skip-false-zero';
+    }
   }
 
   let endFrame = nFrames - 1;
@@ -659,8 +781,7 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
     for (let k = 0; k < minRun; k++) {
       const i = f - k;
       if (i < 0) break;
-      const ratio = fullRms[i] > 1e-6 ? vocRms[i] / fullRms[i] : 0;
-      if (vocRms[i] >= thrV * 0.7 && ratio >= minRatio * 0.8) ok += 1;
+      if (vocRms[i] >= thrV * 0.65 && ratio[i] >= minRatio * 0.75) ok += 1;
     }
     if (ok >= minRun) {
       endFrame = f;
@@ -668,22 +789,23 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
     }
   }
 
-  const onsetSec = (onsetFrame * hop) / sampleRate;
   const endSec = Math.min(
-    mono.length / sampleRate,
-    ((endFrame * hop + frameSize) / sampleRate),
+    durationSec,
+    (endFrame * hop + frameSize) / sampleRate,
   );
 
   return {
     onsetSec,
     endSec,
     peakRms: peakV,
-    method: 'vocal-ratio',
+    method,
+    introSec: searchFromSec,
   };
 }
 
 /**
  * Decode file and detect singing/speech onset (skips pure instrumental intros).
+ * Assumption: lyrics/singing almost never begin at 0:00 on commercial music beds.
  * @param {File | Blob} file
  * @param {(msg: string) => void} [onLog]
  * @returns {Promise<{ onsetSec: number, endSec: number, durationSec: number, method?: string }>}
@@ -692,7 +814,7 @@ export async function detectAudioSpeechOnset(file, onLog) {
   const wave = await decodeAudioForWhisper(file, onLog);
   const durationSec = wave.length / SAMPLE_RATE;
 
-  onLog?.('分析人聲／歌聲頻段（略過前奏樂器）…');
+  onLog?.('分析歌聲起點（前奏樂器 ≠ 開唱，通常不是 0:00）…');
   let vocal = wave;
   try {
     vocal = await filterVocalBand(wave, SAMPLE_RATE);
@@ -700,34 +822,35 @@ export async function detectAudioSpeechOnset(file, onLog) {
     onLog?.(`人聲濾波失敗，改用全頻：${e?.message || e}`);
   }
 
-  const bounds = detectVocalOnsetFromBands(wave, vocal, SAMPLE_RATE);
+  let bounds = detectVocalOnsetFromBands(wave, vocal, SAMPLE_RATE);
 
-  // If "onset" is almost at 0 but intro is loud music, try stricter second pass
-  // starting after a short ignore window when early frames are bass-heavy
-  if (bounds.onsetSec < 0.35 && durationSec > 5) {
+  // Hard guard: on tracks > 8s, refuse 0:00–0:40 unless vocals are clearly dominant early
+  if (durationSec > 8 && bounds.onsetSec < 0.45) {
     const retry = detectSpeechBounds(vocal, SAMPLE_RATE, {
       frameMs: 40,
-      thresholdRatio: 0.22,
-      minRunFrames: 8,
-      minOnsetSec: 0.4,
+      thresholdRatio: 0.24,
+      minRunFrames: 10,
+      minOnsetSec: 1.5,
     });
-    // Prefer later onset if much stronger sustained vocal later
-    if (retry.onsetSec > bounds.onsetSec + 0.8) {
+    if (retry.onsetSec > 1.0) {
       onLog?.(
-        `前奏偏樂器，改採較晚歌聲起點 ${retry.onsetSec.toFixed(2)}s（原 ${bounds.onsetSec.toFixed(2)}s）`,
+        `拒絕 0:00 起點（多為前奏），改用 ${retry.onsetSec.toFixed(2)}s 開唱`,
       );
-      return {
+      bounds = {
         onsetSec: retry.onsetSec,
         endSec: retry.endSec,
-        durationSec,
-        method: 'vocal-late-pass',
+        peakRms: bounds.peakRms,
+        method: 'reject-zero-intro',
+        introSec: bounds.introSec || 1.5,
       };
     }
   }
 
   onLog?.(
-    `歌聲／人聲起點≈${bounds.onsetSec.toFixed(2)}s · 終點≈${bounds.endSec.toFixed(2)}s · 方法=${bounds.method}`,
+    `開唱／人聲≈${bounds.onsetSec.toFixed(2)}s（不是從 0:00）· 終點≈${bounds.endSec.toFixed(2)}s · ${bounds.method}` +
+      (bounds.introSec ? ` · 略過前奏~${bounds.introSec.toFixed(1)}s` : ''),
   );
+
   return {
     onsetSec: bounds.onsetSec,
     endSec: bounds.endSec,
