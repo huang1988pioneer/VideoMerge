@@ -475,6 +475,41 @@ body {
   white-space: nowrap;
 }
 
+.audio-sub-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.field-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: auto;
+}
+
+.field-select {
+  min-height: 2.35rem;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.875rem;
+}
+
+.field-select:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  border-color: transparent;
+}
+
+.field-select:disabled {
+  opacity: 0.45;
+}
+
 /* —— Buttons —— */
 .btn {
   appearance: none;

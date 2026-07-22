@@ -420,6 +420,41 @@ function formatSec(sec) {
 }
 
 /**
+ * Soft-mux SRT subtitles into MP4 (mov_text). Falls back by throwing.
+ * @param {FFmpeg} ff
+ * @param {string} videoName
+ * @param {string} srtName
+ * @param {string} output
+ * @param {(msg: string) => void} [onLog]
+ */
+async function muxSubtitles(ff, videoName, srtName, output, onLog) {
+  await execOrThrow(
+    ff,
+    [
+      '-i',
+      videoName,
+      '-i',
+      srtName,
+      '-map',
+      '0',
+      '-map',
+      '1',
+      '-c',
+      'copy',
+      '-c:s',
+      'mov_text',
+      '-metadata:s:s:0',
+      'language=zho',
+      '-movflags',
+      '+faststart',
+      '-y',
+      output,
+    ],
+    onLog,
+  );
+}
+
+/**
  * Replace video audio with a custom audio file (mp3 etc).
  * Loops audio if shorter than video; trims to video length if longer.
  * @param {FFmpeg} ff
@@ -504,6 +539,7 @@ async function muxCustomAudio(ff, videoName, audioName, output, onLog) {
  * @param {{
  *   noAudio?: boolean,
  *   audioFile?: File | null,
+ *   subtitleSrt?: string | null,
  *   loop?: {
  *     mode: 'once' | 'count' | 'duration',
  *     count?: number,
@@ -514,7 +550,7 @@ async function muxCustomAudio(ff, videoName, audioName, output, onLog) {
  *   onProgress?: (ratio: number) => void,
  *   onStatus?: (status: string) => void,
  * }} [hooks]
- * @returns {Promise<Blob>}
+ * @returns {Promise<{ blob: Blob, subtitlesEmbedded: boolean }>}
  */
 export async function mergeVideos(files, hooks = {}) {
   if (!files?.length) throw new Error('請至少選擇一段影片');
@@ -525,6 +561,7 @@ export async function mergeVideos(files, hooks = {}) {
     onStatus,
     noAudio = false,
     audioFile = null,
+    subtitleSrt = null,
     loop = { mode: 'once' },
   } = hooks;
   const ff = await ensureFFmpeg(onLog, onProgress);
@@ -628,20 +665,51 @@ export async function mergeVideos(files, hooks = {}) {
     if (!useCustomAudio) written.push('output.mp4');
 
     // 4) Mux custom MP3 / audio as soundtrack
+    let currentVideo = useCustomAudio ? videoOut : 'output.mp4';
     if (useCustomAudio && audioMemName) {
       onStatus?.('套用自訂音軌（MP3）…');
       await muxCustomAudio(ff, videoOut, audioMemName, 'output.mp4', onLog);
       written.push('output.mp4');
+      currentVideo = 'output.mp4';
+    }
+
+    // 5) Soft-mux subtitles when provided
+    let subtitlesEmbedded = false;
+    if (subtitleSrt && subtitleSrt.trim()) {
+      onStatus?.('嵌入字幕…');
+      const srtName = 'subs.srt';
+      await ff.writeFile(srtName, subtitleSrt);
+      written.push(srtName);
+      try {
+        const withSubs = 'output_subs.mp4';
+        await muxSubtitles(ff, currentVideo, srtName, withSubs, onLog);
+        written.push(withSubs);
+        // Replace output.mp4
+        const subData = await ff.readFile(withSubs);
+        await ff.writeFile('output.mp4', subData);
+        currentVideo = 'output.mp4';
+        subtitlesEmbedded = true;
+        onLog?.('字幕已嵌入 MP4（mov_text）');
+      } catch (err) {
+        onLog?.(
+          `嵌入字幕失敗（仍會提供 SRT 下載）：${err?.message || err}`,
+        );
+        subtitlesEmbedded = false;
+      }
     }
 
     onStatus?.('讀取結果…');
-    const data = await ff.readFile('output.mp4');
+    const data = await ff.readFile(currentVideo === 'output.mp4' ? 'output.mp4' : currentVideo);
+    if (!written.includes('output.mp4')) written.push('output.mp4');
 
     const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
     if (!u8.byteLength) {
       throw new Error('合併結果是空檔，請換一段影片再試');
     }
-    return new Blob([u8], { type: 'video/mp4' });
+    return {
+      blob: new Blob([u8], { type: 'video/mp4' }),
+      subtitlesEmbedded,
+    };
   } finally {
     for (const name of written) {
       try {

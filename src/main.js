@@ -1,6 +1,13 @@
 import './style.css';
 import { extractFrames, formatBytes, formatDuration } from './frames.js';
 import { LOOP_LIMITS, mergeVideos } from './merge.js';
+import {
+  getMediaDuration,
+  tileChunksToDuration,
+  chunksToSrt,
+  chunksToVtt,
+  transcribeAudioToSubtitles,
+} from './subtitle.js';
 
 /** @typedef {{
  *   id: string,
@@ -23,6 +30,10 @@ let merging = false;
 let resultUrl = null;
 /** @type {File | null} */
 let audioFile = null;
+/** @type {string | null} */
+let lastSrtUrl = null;
+/** @type {string | null} */
+let lastVttUrl = null;
 
 const app = document.querySelector('#app');
 
@@ -157,8 +168,23 @@ app.innerHTML = `
           <button type="button" class="btn btn-danger btn-sm" id="btn-clear-audio" disabled>清除</button>
           <span class="audio-name" id="audio-name">未選擇音訊</span>
         </div>
+        <div class="audio-sub-row">
+          <label class="opt-check" for="opt-auto-subs" title="依 MP3 語音自動產生字幕（需網路下載模型）">
+            <input type="checkbox" id="opt-auto-subs" />
+            <span>依音軌自動字幕</span>
+          </label>
+          <label class="field field-inline" for="sub-lang">
+            <span class="field-label">辨識語言</span>
+            <select id="sub-lang" class="field-select">
+              <option value="chinese" selected>中文</option>
+              <option value="english">英文</option>
+              <option value="auto">自動偵測</option>
+            </select>
+          </label>
+        </div>
         <p class="field-hint">
           勾選「不要聲音」時會忽略此音軌。音訊比影片短會循環，比影片長則裁到影片長度。
+          自動字幕使用瀏覽器內 Whisper，首次需下載模型；需已選擇 MP3。
         </p>
       </div>
     </section>
@@ -187,11 +213,15 @@ app.innerHTML = `
 
       <div class="result-block" id="result-block">
         <h3>合併完成</h3>
-        <video class="result-video" id="result-video" controls playsinline></video>
+        <video class="result-video" id="result-video" controls playsinline crossorigin="anonymous">
+          <track id="result-track" kind="subtitles" srclang="zh" label="自動字幕" default hidden />
+        </video>
         <div class="result-actions">
           <a class="btn btn-primary" id="btn-download" download="merged.mp4">下載合併影片</a>
+          <a class="btn btn-ghost" id="btn-download-srt" download="subtitles.srt" hidden>下載 SRT 字幕</a>
           <button type="button" class="btn btn-ghost" id="btn-dismiss-result">關閉預覽</button>
         </div>
+        <p class="field-hint" id="subs-result-hint" hidden></p>
       </div>
     </section>
   </main>
@@ -222,6 +252,11 @@ const els = {
   btnClearAudio: document.getElementById('btn-clear-audio'),
   audioName: document.getElementById('audio-name'),
   audioHint: document.getElementById('audio-hint'),
+  optAutoSubs: document.getElementById('opt-auto-subs'),
+  subLang: document.getElementById('sub-lang'),
+  resultTrack: document.getElementById('result-track'),
+  btnDownloadSrt: document.getElementById('btn-download-srt'),
+  subsResultHint: document.getElementById('subs-result-hint'),
   clipsRoot: document.getElementById('clips-root'),
   clipsCount: document.getElementById('clips-count'),
   progressBlock: document.getElementById('progress-block'),
@@ -327,6 +362,13 @@ function syncAudioUI() {
 
   els.btnPickAudio.disabled = merging || muted;
   els.audioInput.disabled = merging || muted;
+
+  const canSubs = Boolean(audioFile) && !muted;
+  els.optAutoSubs.disabled = merging || !canSubs;
+  els.subLang.disabled = merging || !canSubs || !els.optAutoSubs.checked;
+  if (!canSubs && els.optAutoSubs.checked) {
+    // keep checked state but disabled — user sees intent; merge will skip if no audio
+  }
 }
 
 function setAudioFile(file) {
@@ -377,10 +419,46 @@ function revokeResult() {
     URL.revokeObjectURL(resultUrl);
     resultUrl = null;
   }
+  if (lastSrtUrl) {
+    URL.revokeObjectURL(lastSrtUrl);
+    lastSrtUrl = null;
+  }
+  if (lastVttUrl) {
+    URL.revokeObjectURL(lastVttUrl);
+    lastVttUrl = null;
+  }
   els.resultVideo.removeAttribute('src');
+  if (els.resultTrack) {
+    els.resultTrack.removeAttribute('src');
+    els.resultTrack.default = false;
+    els.resultTrack.hidden = true;
+  }
+  if (els.btnDownloadSrt) {
+    els.btnDownloadSrt.hidden = true;
+    els.btnDownloadSrt.removeAttribute('href');
+  }
+  if (els.subsResultHint) {
+    els.subsResultHint.hidden = true;
+    els.subsResultHint.textContent = '';
+  }
   els.resultVideo.load();
   els.resultBlock.classList.remove('is-visible');
   els.btnDownload.removeAttribute('href');
+}
+
+/**
+ * Estimate final video duration from loop options + ready clips.
+ */
+function estimateOutputDurationSec() {
+  const base = baseSequenceDuration();
+  const loop = getLoopOptions();
+  if (loop.mode === 'count') {
+    return base * Math.max(1, loop.count || 1);
+  }
+  if (loop.mode === 'duration') {
+    return Math.max(0, loop.targetSeconds || 0);
+  }
+  return base;
 }
 
 function setProgress(ratio, status) {
@@ -633,6 +711,11 @@ async function runMerge() {
     const noAudio = Boolean(els.optNoAudio.checked);
     const loop = getLoopOptions();
     const bgm = !noAudio && audioFile instanceof File ? audioFile : null;
+    const wantSubs = Boolean(els.optAutoSubs.checked) && Boolean(bgm);
+
+    if (els.optAutoSubs.checked && !bgm) {
+      throw new Error('自動字幕需要先選擇 MP3 音軌（且勿勾選「不要聲音」）');
+    }
 
     if (loop.mode === 'count') {
       if (loop.count < 1 || loop.count > LOOP_LIMITS.maxCount) {
@@ -650,16 +733,59 @@ async function runMerge() {
       }
     }
 
-    const blob = await mergeVideos(
+    let subtitleSrt = null;
+    let subtitleVtt = null;
+    let subChunkCount = 0;
+
+    if (wantSubs) {
+      setProgress(0.05, '語音辨識中…');
+      const lang = els.subLang.value || 'chinese';
+      const asr = await transcribeAudioToSubtitles(bgm, {
+        language: lang === 'auto' ? null : lang,
+        onStatus: (s) => setProgress(undefined, s),
+        onProgress: (p) => {
+          if (typeof p === 'number' && Number.isFinite(p)) {
+            setProgress(Math.min(0.35, p * 0.35), els.progressStatus.textContent);
+          }
+        },
+        onLog: (msg) => appendLog(msg),
+      });
+
+      let chunks = asr.chunks;
+      try {
+        const audioDur = await getMediaDuration(bgm);
+        const videoDur = estimateOutputDurationSec();
+        if (videoDur > 0 && audioDur > 0) {
+          chunks = tileChunksToDuration(chunks, audioDur, videoDur);
+          appendLog(
+            `字幕對齊：音訊 ${audioDur.toFixed(1)}s → 影片約 ${videoDur.toFixed(1)}s，句數 ${chunks.length}`,
+          );
+        }
+      } catch (e) {
+        appendLog(`字幕時長對齊略過：${e?.message || e}`);
+      }
+
+      subtitleSrt = chunksToSrt(chunks);
+      subtitleVtt = chunksToVtt(chunks);
+      subChunkCount = chunks.length;
+      setProgress(0.4, '開始合併影片…');
+    }
+
+    const { blob, subtitlesEmbedded } = await mergeVideos(
       ready.map((c) => c.file),
       {
         noAudio,
         audioFile: bgm,
+        subtitleSrt,
         loop,
         onStatus: (s) => setProgress(undefined, s),
         onProgress: (p) => {
           if (typeof p === 'number' && Number.isFinite(p)) {
-            setProgress(Math.min(p, 0.99), els.progressStatus.textContent);
+            const base = wantSubs ? 0.4 : 0;
+            setProgress(
+              Math.min(0.99, base + p * (1 - base)),
+              els.progressStatus.textContent,
+            );
           }
         },
         onLog: (msg) => appendLog(msg),
@@ -671,8 +797,38 @@ async function runMerge() {
     els.resultVideo.src = resultUrl;
     els.btnDownload.href = resultUrl;
     els.btnDownload.download = `merged-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.mp4`;
+
+    if (subtitleSrt && subtitleVtt) {
+      lastSrtUrl = URL.createObjectURL(
+        new Blob([subtitleSrt], { type: 'text/plain;charset=utf-8' }),
+      );
+      lastVttUrl = URL.createObjectURL(
+        new Blob([subtitleVtt], { type: 'text/vtt;charset=utf-8' }),
+      );
+      els.btnDownloadSrt.hidden = false;
+      els.btnDownloadSrt.href = lastSrtUrl;
+      els.btnDownloadSrt.download = `subtitles-${new Date().toISOString().slice(0, 10)}.srt`;
+
+      if (els.resultTrack && lastVttUrl) {
+        els.resultTrack.hidden = false;
+        els.resultTrack.src = lastVttUrl;
+        els.resultTrack.default = true;
+        // Re-load so track attaches
+        els.resultVideo.load();
+        els.resultVideo.src = resultUrl;
+      }
+
+      els.subsResultHint.hidden = false;
+      els.subsResultHint.textContent = subtitlesEmbedded
+        ? `已產生 ${subChunkCount} 句字幕並嘗試嵌入影片；亦可下載 SRT。預覽請開啟播放器字幕。`
+        : `已產生 ${subChunkCount} 句字幕（嵌入影片失敗時仍可下載 SRT，預覽使用 WebVTT）。`;
+    }
+
     els.resultBlock.classList.add('is-visible');
-    toast('合併完成，可預覽或下載', 'success');
+    toast(
+      wantSubs ? '合併完成（含自動字幕）' : '合併完成，可預覽或下載',
+      'success',
+    );
     els.resultBlock.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (err) {
     console.error(err);
@@ -709,6 +865,17 @@ els.audioInput.addEventListener('change', () => {
   els.audioInput.value = '';
 });
 els.optNoAudio.addEventListener('change', () => {
+  syncAudioUI();
+});
+els.optAutoSubs.addEventListener('change', () => {
+  if (els.optAutoSubs.checked && !audioFile) {
+    toast('請先選擇 MP3 音軌', 'error');
+    els.optAutoSubs.checked = false;
+  }
+  if (els.optAutoSubs.checked && els.optNoAudio.checked) {
+    els.optNoAudio.checked = false;
+    toast('已關閉「不要聲音」以便產生字幕');
+  }
   syncAudioUI();
 });
 
