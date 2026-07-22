@@ -34,6 +34,10 @@ let audioFile = null;
 let lastSrtUrl = null;
 /** @type {string | null} */
 let lastVttUrl = null;
+/** @type {string | null} */
+let lastSrtText = null;
+/** @type {string | null} */
+let lastSrtFilename = null;
 
 const app = document.querySelector('#app');
 
@@ -219,7 +223,10 @@ app.innerHTML = `
           </div>
           <div class="result-collapsed-actions">
             <button type="button" class="btn btn-primary btn-sm" id="btn-show-result">顯示預覽</button>
-            <a class="btn btn-ghost btn-sm" id="btn-download-collapsed" download="merged.mp4">下載</a>
+            <a class="btn btn-ghost btn-sm" id="btn-download-collapsed" download="merged.mp4">下載影片</a>
+            <button type="button" class="btn btn-ghost btn-sm" id="btn-download-srt-collapsed" hidden>
+              下載 SRT
+            </button>
           </div>
         </div>
         <div class="result-body" id="result-body">
@@ -229,7 +236,9 @@ app.innerHTML = `
           </video>
           <div class="result-actions">
             <a class="btn btn-primary" id="btn-download" download="merged.mp4">下載合併影片</a>
-            <a class="btn btn-ghost" id="btn-download-srt" download="subtitles.srt" hidden>下載 SRT 字幕</a>
+            <button type="button" class="btn btn-ghost" id="btn-download-srt" hidden>
+              下載 SRT 字幕
+            </button>
             <button type="button" class="btn btn-ghost" id="btn-dismiss-result">收合預覽</button>
           </div>
           <p class="field-hint" id="subs-result-hint" hidden></p>
@@ -283,11 +292,50 @@ const els = {
   resultVideo: document.getElementById('result-video'),
   btnDownload: document.getElementById('btn-download'),
   btnDownloadCollapsed: document.getElementById('btn-download-collapsed'),
+  btnDownloadSrtCollapsed: document.getElementById('btn-download-srt-collapsed'),
   btnShowResult: document.getElementById('btn-show-result'),
   btnDismissResult: document.getElementById('btn-dismiss-result'),
   toastRegion: document.getElementById('toast-region'),
   headerMeta: document.getElementById('header-meta'),
 };
+
+/**
+ * Trigger a file download reliably (blob + temporary <a>).
+ * @param {string} filename
+ * @param {BlobPart} data
+ * @param {string} [mime]
+ */
+function downloadBlob(filename, data, mime = 'application/octet-stream') {
+  const blob = data instanceof Blob ? data : new Blob([data], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Delay revoke so the browser can start the download
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+function downloadSrt() {
+  if (!lastSrtText) {
+    toast('目前沒有可下載的字幕', 'error');
+    return;
+  }
+  const name = lastSrtFilename || 'subtitles.srt';
+  // UTF-8 BOM helps Windows Notepad / some players recognize Chinese SRT
+  const bom = '\uFEFF';
+  downloadBlob(name, bom + lastSrtText, 'application/x-subrip;charset=utf-8');
+  toast(`已開始下載 ${name}`, 'success');
+}
+
+function setSrtDownloadVisible(visible) {
+  if (els.btnDownloadSrt) els.btnDownloadSrt.hidden = !visible;
+  if (els.btnDownloadSrtCollapsed) els.btnDownloadSrtCollapsed.hidden = !visible;
+}
 
 function getLoopMode() {
   const el = document.querySelector('input[name="loop-mode"]:checked');
@@ -445,6 +493,7 @@ function hideResultPreview() {
     els.btnDownloadCollapsed.href = resultUrl;
     els.btnDownloadCollapsed.download = els.btnDownload.download || 'merged.mp4';
   }
+  setSrtDownloadVisible(Boolean(lastSrtText));
 }
 
 /** Expand preview again from last merge result. */
@@ -486,10 +535,9 @@ function revokeResult() {
     els.resultTrack.default = false;
     els.resultTrack.hidden = true;
   }
-  if (els.btnDownloadSrt) {
-    els.btnDownloadSrt.hidden = true;
-    els.btnDownloadSrt.removeAttribute('href');
-  }
+  lastSrtText = null;
+  lastSrtFilename = null;
+  setSrtDownloadVisible(false);
   if (els.subsResultHint) {
     els.subsResultHint.hidden = true;
     els.subsResultHint.textContent = '';
@@ -876,16 +924,27 @@ async function runMerge() {
     els.btnDownload.href = resultUrl;
     els.btnDownload.download = `merged-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.mp4`;
 
-    if (subtitleSrt && subtitleVtt) {
+    if (subtitleSrt && subtitleSrt.trim()) {
+      lastSrtText = subtitleSrt;
+      lastSrtFilename = `subtitles-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.srt`;
+      if (lastSrtUrl) {
+        URL.revokeObjectURL(lastSrtUrl);
+        lastSrtUrl = null;
+      }
       lastSrtUrl = URL.createObjectURL(
-        new Blob([subtitleSrt], { type: 'text/plain;charset=utf-8' }),
+        new Blob(['\uFEFF' + subtitleSrt], {
+          type: 'application/x-subrip;charset=utf-8',
+        }),
       );
-      lastVttUrl = URL.createObjectURL(
-        new Blob([subtitleVtt], { type: 'text/vtt;charset=utf-8' }),
-      );
-      els.btnDownloadSrt.hidden = false;
-      els.btnDownloadSrt.href = lastSrtUrl;
-      els.btnDownloadSrt.download = `subtitles-${new Date().toISOString().slice(0, 10)}.srt`;
+
+      if (subtitleVtt) {
+        if (lastVttUrl) URL.revokeObjectURL(lastVttUrl);
+        lastVttUrl = URL.createObjectURL(
+          new Blob([subtitleVtt], { type: 'text/vtt;charset=utf-8' }),
+        );
+      }
+
+      setSrtDownloadVisible(true);
 
       if (els.resultTrack && lastVttUrl) {
         els.resultTrack.hidden = false;
@@ -898,8 +957,12 @@ async function runMerge() {
 
       els.subsResultHint.hidden = false;
       els.subsResultHint.textContent = subtitlesEmbedded
-        ? `已產生 ${subChunkCount} 句字幕並嘗試嵌入影片；亦可下載 SRT。預覽請開啟播放器字幕。`
-        : `已產生 ${subChunkCount} 句字幕（嵌入影片失敗時仍可下載 SRT，預覽使用 WebVTT）。`;
+        ? `已產生 ${subChunkCount} 句字幕並嘗試嵌入影片；可按「下載 SRT 字幕」。預覽請開啟播放器字幕。`
+        : `已產生 ${subChunkCount} 句字幕；可按「下載 SRT 字幕」（預覽使用 WebVTT）。`;
+    } else {
+      lastSrtText = null;
+      lastSrtFilename = null;
+      setSrtDownloadVisible(false);
     }
 
     els.resultBlock.classList.add('is-visible');
@@ -940,6 +1003,14 @@ els.btnClear.addEventListener('click', clearAll);
 els.btnMerge.addEventListener('click', runMerge);
 els.btnDismissResult.addEventListener('click', hideResultPreview);
 els.btnShowResult.addEventListener('click', showResultPreview);
+els.btnDownloadSrt.addEventListener('click', (e) => {
+  e.preventDefault();
+  downloadSrt();
+});
+els.btnDownloadSrtCollapsed.addEventListener('click', (e) => {
+  e.preventDefault();
+  downloadSrt();
+});
 
 els.btnPickAudio.addEventListener('click', () => {
   if (!els.optNoAudio.checked) els.audioInput.click();
