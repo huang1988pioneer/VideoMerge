@@ -237,7 +237,7 @@ app.innerHTML = `
             />
           </label>
           <span class="field-hint script-sync-hint" id="offset-hint">
-            自動偏移會偵測 MP3 開頭人聲，再與第一句字幕對齊；可再加手動微調。
+            開頭靜音不上字幕；偵測到 MP3 人聲後才開始，可再手動微調秒數。
           </span>
         </div>
         <p class="field-hint">
@@ -512,13 +512,13 @@ function syncAudioUI() {
   if (els.offsetHint) {
     if (!audioFile) {
       els.offsetHint.textContent =
-        '自動偏移需要 MP3 音軌；僅影片時請用手動偏移微調。';
+        '「有人聲再上字幕」需要 MP3；僅影片時請用手動偏移。';
     } else if (els.optAutoOffset?.checked) {
       els.offsetHint.textContent =
-        '已開自動偏移：偵測 MP3 人聲起點對齊第一句；右側可再手動加減秒數。';
+        '已啟用：開頭靜音不上字，有人聲才開始字幕；右側可再微調秒數。';
     } else {
       els.offsetHint.textContent =
-        '手動模式：正數延後字幕、負數提前。建議有 MP3 時勾選自動偏移。';
+        '手動模式：正數延後、負數提前。建議勾選「有人聲再上字幕」。';
     }
   }
   if (els.scriptHint) {
@@ -1363,7 +1363,7 @@ els.optScriptSubs.addEventListener('change', () => {
 
 els.optAutoOffset.addEventListener('change', () => {
   if (els.optAutoOffset.checked && !audioFile) {
-    toast('自動偏移需要先選擇 MP3 音軌', 'error');
+    toast('「有人聲再上字幕」需要先選擇 MP3 音軌', 'error');
   }
   syncAudioUI();
 });
