@@ -212,16 +212,28 @@ app.innerHTML = `
       </div>
 
       <div class="result-block" id="result-block">
-        <h3>合併完成</h3>
-        <video class="result-video" id="result-video" controls playsinline crossorigin="anonymous">
-          <track id="result-track" kind="subtitles" srclang="zh" label="自動字幕" default hidden />
-        </video>
-        <div class="result-actions">
-          <a class="btn btn-primary" id="btn-download" download="merged.mp4">下載合併影片</a>
-          <a class="btn btn-ghost" id="btn-download-srt" download="subtitles.srt" hidden>下載 SRT 字幕</a>
-          <button type="button" class="btn btn-ghost" id="btn-dismiss-result">關閉預覽</button>
+        <div class="result-collapsed" id="result-collapsed" hidden>
+          <div class="result-collapsed-text">
+            <strong>上次合併結果已保留</strong>
+            <span>可重新開啟預覽或直接下載</span>
+          </div>
+          <div class="result-collapsed-actions">
+            <button type="button" class="btn btn-primary btn-sm" id="btn-show-result">顯示預覽</button>
+            <a class="btn btn-ghost btn-sm" id="btn-download-collapsed" download="merged.mp4">下載</a>
+          </div>
         </div>
-        <p class="field-hint" id="subs-result-hint" hidden></p>
+        <div class="result-body" id="result-body">
+          <h3>合併完成</h3>
+          <video class="result-video" id="result-video" controls playsinline crossorigin="anonymous">
+            <track id="result-track" kind="subtitles" srclang="zh" label="自動字幕" default hidden />
+          </video>
+          <div class="result-actions">
+            <a class="btn btn-primary" id="btn-download" download="merged.mp4">下載合併影片</a>
+            <a class="btn btn-ghost" id="btn-download-srt" download="subtitles.srt" hidden>下載 SRT 字幕</a>
+            <button type="button" class="btn btn-ghost" id="btn-dismiss-result">收合預覽</button>
+          </div>
+          <p class="field-hint" id="subs-result-hint" hidden></p>
+        </div>
       </div>
     </section>
   </main>
@@ -266,8 +278,12 @@ const els = {
   progressFill: document.getElementById('progress-fill'),
   logBox: document.getElementById('log-box'),
   resultBlock: document.getElementById('result-block'),
+  resultBody: document.getElementById('result-body'),
+  resultCollapsed: document.getElementById('result-collapsed'),
   resultVideo: document.getElementById('result-video'),
   btnDownload: document.getElementById('btn-download'),
+  btnDownloadCollapsed: document.getElementById('btn-download-collapsed'),
+  btnShowResult: document.getElementById('btn-show-result'),
   btnDismissResult: document.getElementById('btn-dismiss-result'),
   toastRegion: document.getElementById('toast-region'),
   headerMeta: document.getElementById('header-meta'),
@@ -414,6 +430,43 @@ function toast(message, type = 'info') {
   }, 4200);
 }
 
+/** Collapse preview UI but keep blob URLs so user can restore. */
+function hideResultPreview() {
+  if (!resultUrl) return;
+  try {
+    els.resultVideo.pause();
+  } catch {
+    /* ignore */
+  }
+  els.resultBlock.classList.add('is-visible', 'is-collapsed');
+  if (els.resultCollapsed) els.resultCollapsed.hidden = false;
+  if (els.resultBody) els.resultBody.hidden = true;
+  if (els.btnDownloadCollapsed && resultUrl) {
+    els.btnDownloadCollapsed.href = resultUrl;
+    els.btnDownloadCollapsed.download = els.btnDownload.download || 'merged.mp4';
+  }
+}
+
+/** Expand preview again from last merge result. */
+function showResultPreview() {
+  if (!resultUrl) return;
+  els.resultBlock.classList.add('is-visible');
+  els.resultBlock.classList.remove('is-collapsed');
+  if (els.resultCollapsed) els.resultCollapsed.hidden = true;
+  if (els.resultBody) els.resultBody.hidden = false;
+  // Ensure video still points at last result
+  if (els.resultVideo.src !== resultUrl) {
+    els.resultVideo.src = resultUrl;
+  }
+  if (lastVttUrl && els.resultTrack) {
+    els.resultTrack.hidden = false;
+    els.resultTrack.src = lastVttUrl;
+    els.resultTrack.default = true;
+  }
+  els.resultBlock.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/** Fully discard last result (new merge / clear all). */
 function revokeResult() {
   if (resultUrl) {
     URL.revokeObjectURL(resultUrl);
@@ -441,8 +494,13 @@ function revokeResult() {
     els.subsResultHint.hidden = true;
     els.subsResultHint.textContent = '';
   }
+  if (els.btnDownloadCollapsed) {
+    els.btnDownloadCollapsed.removeAttribute('href');
+  }
   els.resultVideo.load();
-  els.resultBlock.classList.remove('is-visible');
+  els.resultBlock.classList.remove('is-visible', 'is-collapsed');
+  if (els.resultCollapsed) els.resultCollapsed.hidden = true;
+  if (els.resultBody) els.resultBody.hidden = false;
   els.btnDownload.removeAttribute('href');
 }
 
@@ -825,6 +883,13 @@ async function runMerge() {
     }
 
     els.resultBlock.classList.add('is-visible');
+    els.resultBlock.classList.remove('is-collapsed');
+    if (els.resultCollapsed) els.resultCollapsed.hidden = true;
+    if (els.resultBody) els.resultBody.hidden = false;
+    if (els.btnDownloadCollapsed) {
+      els.btnDownloadCollapsed.href = resultUrl;
+      els.btnDownloadCollapsed.download = els.btnDownload.download;
+    }
     toast(
       wantSubs ? '合併完成（含自動字幕）' : '合併完成，可預覽或下載',
       'success',
@@ -853,7 +918,8 @@ els.fileInput.addEventListener('change', () => {
 els.btnAddMore.addEventListener('click', () => els.fileInput.click());
 els.btnClear.addEventListener('click', clearAll);
 els.btnMerge.addEventListener('click', runMerge);
-els.btnDismissResult.addEventListener('click', revokeResult);
+els.btnDismissResult.addEventListener('click', hideResultPreview);
+els.btnShowResult.addEventListener('click', showResultPreview);
 
 els.btnPickAudio.addEventListener('click', () => {
   if (!els.optNoAudio.checked) els.audioInput.click();

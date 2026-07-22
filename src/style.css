@@ -907,6 +907,55 @@ body {
   font-weight: 600;
 }
 
+.result-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.result-collapsed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.result-collapsed[hidden] {
+  display: none !important;
+}
+
+.result-body[hidden] {
+  display: none !important;
+}
+
+.result-collapsed-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.result-collapsed-text strong {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.result-collapsed-text span {
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+.result-collapsed-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
 .result-video {
   width: 100%;
   max-height: 360px;
