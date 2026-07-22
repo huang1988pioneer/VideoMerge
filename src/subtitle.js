@@ -556,23 +556,91 @@ export async function detectAudioSpeechOnset(file, onLog) {
  * offset = speechOnset - firstCueStart  (positive → delay subtitles)
  * @param {SubChunk[]} chunks
  * @param {number} speechOnsetSec
- * @param {{ clamp?: [number, number] }} [opts]
+ * @param {{ clamp?: [number, number], biasSec?: number }} [opts]
  * @returns {number}
  */
 export function computeAutoOffsetSec(chunks, speechOnsetSec, opts = {}) {
   const [lo, hi] = opts.clamp || [-15, 15];
+  // Slightly before speech feels natural for reading; keep tiny
+  const bias = opts.biasSec ?? -0.05;
   if (!chunks?.length) return 0;
   const firstStart = Number(chunks[0].timestamp?.[0]) || 0;
   const onset = Number(speechOnsetSec);
   if (!Number.isFinite(onset)) return 0;
-  // Small bias: show subtitle ~80ms before perceived speech (reading comfort)
-  const bias = -0.08;
   let delta = onset - firstStart + bias;
   if (!Number.isFinite(delta)) return 0;
   delta = Math.max(lo, Math.min(hi, delta));
-  // Ignore tiny jitter
-  if (Math.abs(delta) < 0.05) return 0;
+  if (Math.abs(delta) < 0.03) return 0;
   return Math.round(delta * 100) / 100;
+}
+
+/**
+ * Build script subtitles that only start when speech starts (silence before = no cues).
+ * Plain text is paced across the active speech window [onset, end], then placed at onset.
+ * Timed SRT/VTT is shifted so first cue meets speech onset.
+ *
+ * @param {string} scriptText
+ * @param {{
+ *   cycleDur: number,
+ *   onsetSec: number,
+ *   endSec: number,
+ * }} speech
+ * @returns {{ chunks: SubChunk[], srt: string, vtt: string, text: string, source: string }}
+ */
+export function scriptToSubtitlesFromSpeechStart(scriptText, speech) {
+  const cycleDur = Math.max(0.5, Number(speech.cycleDur) || 0);
+  let onset = Math.max(0, Number(speech.onsetSec) || 0);
+  let end = Number(speech.endSec);
+  if (!Number.isFinite(end) || end <= onset + 0.3) {
+    end = cycleDur;
+  }
+  end = Math.min(cycleDur, end);
+  // Keep a little tail after last energy for last syllable
+  end = Math.min(cycleDur, end + 0.15);
+  onset = Math.min(onset, Math.max(0, end - 0.5));
+
+  const span = Math.max(0.6, end - onset);
+
+  // Timed files: keep relative structure, only snap start to speech
+  const timed = parseTimedScript(scriptText);
+  if (timed?.length) {
+    const delta = computeAutoOffsetSec(timed, onset, { biasSec: 0 });
+    const chunks = shiftChunks(timed, delta, cycleDur);
+    // Drop any cue still entirely before speech (shouldn't happen)
+    const filtered = chunks.filter((c) => c.timestamp[1] > onset - 0.05);
+    return {
+      chunks: filtered.length ? filtered : chunks,
+      srt: chunksToSrt(filtered.length ? filtered : chunks),
+      vtt: chunksToVtt(filtered.length ? filtered : chunks),
+      text: (filtered.length ? filtered : chunks).map((c) => c.text).join(' '),
+      source: 'timed+speech-start',
+    };
+  }
+
+  // Plain script: fit into speech window only (no pre-roll before voice)
+  const built = scriptToSubtitles(scriptText, span, {
+    leadInSec: 0,
+    leadOutSec: 0.08,
+    minCueSec: 0.7,
+    maxCueSec: 7.5,
+  });
+  // Place window at speech onset
+  const placed = shiftChunks(built.chunks, onset, cycleDur);
+  // Ensure first cue starts at/after onset (no silent-region subtitles)
+  if (placed.length) {
+    placed[0].timestamp[0] = Math.max(placed[0].timestamp[0], onset);
+    if (placed[0].timestamp[1] <= placed[0].timestamp[0]) {
+      placed[0].timestamp[1] = Math.min(cycleDur, placed[0].timestamp[0] + 0.6);
+    }
+  }
+
+  return {
+    chunks: placed,
+    srt: chunksToSrt(placed),
+    vtt: chunksToVtt(placed),
+    text: built.text,
+    source: 'script+speech-start',
+  };
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   chunksToVtt,
   transcribeAudioToSubtitles,
   scriptToSubtitles,
+  scriptToSubtitlesFromSpeechStart,
   resolveSubtitleTimeline,
   shiftChunks,
   detectAudioSpeechOnset,
@@ -218,9 +219,9 @@ app.innerHTML = `
           placeholder="在此貼上語音稿（純文字）。也支援已有時間軸的 SRT / VTT，或 [00:01-00:03] 字幕 格式。&#10;&#10;範例：&#10;大家好，歡迎收看本期節目。&#10;今天我們來介紹影片合併功能。"
         ></textarea>
         <div class="script-sync-row">
-          <label class="opt-check" for="opt-auto-offset" title="依 MP3 開頭人聲自動計算字幕偏移">
+          <label class="opt-check" for="opt-auto-offset" title="偵測 MP3 開頭人聲後才開始上字幕">
             <input type="checkbox" id="opt-auto-offset" checked />
-            <span>自動偏移</span>
+            <span>有人聲再上字幕</span>
           </label>
           <label class="field field-inline" for="sub-offset" title="正數：字幕延後；負數：字幕提前">
             <span class="field-label">手動偏移（秒）</span>
@@ -543,32 +544,30 @@ function getManualOffsetSec() {
 }
 
 /**
- * Apply auto speech-onset offset (+ optional manual) to subtitle chunks.
- * @param {import('./subtitle.js').SubChunk[] | { timestamp: [number, number], text: string }[]} chunks
+ * Snap existing cues so subtitles start when voice starts (+ manual fine-tune).
+ * @param {{ timestamp: [number, number], text: string }[]} chunks
  * @param {File | null} bgm
  * @param {number} totalDur
  * @param {(msg: string) => void} [log]
  */
 async function applySubtitleOffset(chunks, bgm, totalDur, log) {
   let offset = getManualOffsetSec();
-  let autoPart = 0;
 
   if (els.optAutoOffset?.checked && bgm) {
     try {
-      setProgress(undefined, '偵測人聲起點（自動偏移）…');
+      setProgress(undefined, '偵測人聲起點…');
       const speech = await detectAudioSpeechOnset(bgm, log);
-      autoPart = computeAutoOffsetSec(chunks, speech.onsetSec);
+      const autoPart = computeAutoOffsetSec(chunks, speech.onsetSec, { biasSec: 0 });
       offset += autoPart;
       log?.(
-        `自動偏移：人聲@${speech.onsetSec.toFixed(2)}s 第一句@${(chunks[0]?.timestamp?.[0] ?? 0).toFixed(2)}s → auto ${autoPart >= 0 ? '+' : ''}${autoPart}s` +
-          (getManualOffsetSec() ? ` + 手動 ${getManualOffsetSec()}s` : '') +
-          ` = 合計 ${offset >= 0 ? '+' : ''}${offset.toFixed(2)}s`,
+        `人聲起點@${speech.onsetSec.toFixed(2)}s → 字幕從此人聲開始（偏移 ${autoPart >= 0 ? '+' : ''}${autoPart}s）` +
+          (getManualOffsetSec() ? ` + 手動 ${getManualOffsetSec()}s` : ''),
       );
       if (els.offsetHint) {
-        els.offsetHint.textContent = `上次自動偏移 ${autoPart >= 0 ? '+' : ''}${autoPart}s（人聲約 ${speech.onsetSec.toFixed(2)}s）`;
+        els.offsetHint.textContent = `字幕自 ${speech.onsetSec.toFixed(2)}s 人聲起顯示（偏移 ${autoPart >= 0 ? '+' : ''}${autoPart}s）`;
       }
     } catch (e) {
-      log?.(`自動偏移失敗，改用手動：${e?.message || e}`);
+      log?.(`人聲偵測失敗，改用手動偏移：${e?.message || e}`);
     }
   } else if (offset !== 0) {
     log?.(`手動字幕偏移：${offset > 0 ? '+' : ''}${offset}s`);
@@ -1069,11 +1068,54 @@ async function runMerge() {
           ` video=${videoDur.toFixed(2)}s`,
       );
 
-      const built = scriptToSubtitles(scriptRaw, timeline.cycleDur);
-      let chunks = built.chunks;
+      /** @type {{ chunks: any[], source: string, text: string }} */
+      let built;
+      let chunks;
 
-      // Offset against one cycle first, then tile (keeps sync on each audio loop)
-      chunks = await applySubtitleOffset(chunks, bgm, timeline.cycleDur, appendLog);
+      // Default: wait for voice before first subtitle (needs MP3)
+      if (els.optAutoOffset?.checked && bgm) {
+        setProgress(0.06, '偵測人聲，字幕將從有聲音後開始…');
+        try {
+          const speech = await detectAudioSpeechOnset(bgm, appendLog);
+          built = scriptToSubtitlesFromSpeechStart(scriptRaw, {
+            cycleDur: timeline.cycleDur,
+            onsetSec: speech.onsetSec,
+            endSec: speech.endSec,
+          });
+          chunks = built.chunks;
+          appendLog(
+            `字幕策略：開頭靜音不上字，自 ${speech.onsetSec.toFixed(2)}s 人聲起開始（至 ${speech.endSec.toFixed(2)}s）`,
+          );
+          // Manual fine-tune only
+          const manual = getManualOffsetSec();
+          if (manual) {
+            chunks = shiftChunks(chunks, manual, timeline.cycleDur);
+            appendLog(`手動微調偏移：${manual > 0 ? '+' : ''}${manual}s`);
+          }
+          if (els.offsetHint) {
+            els.offsetHint.textContent = `字幕自 ${speech.onsetSec.toFixed(2)}s 起（偵測到人聲）`;
+          }
+        } catch (e) {
+          appendLog(`人聲偵測失敗，改一般排程：${e?.message || e}`);
+          built = scriptToSubtitles(scriptRaw, timeline.cycleDur, {
+            leadInSec: 0,
+          });
+          chunks = await applySubtitleOffset(
+            built.chunks,
+            bgm,
+            timeline.cycleDur,
+            appendLog,
+          );
+        }
+      } else {
+        built = scriptToSubtitles(scriptRaw, timeline.cycleDur, { leadInSec: 0 });
+        chunks = await applySubtitleOffset(
+          built.chunks,
+          bgm,
+          timeline.cycleDur,
+          appendLog,
+        );
+      }
 
       // Tile when video is longer than one speech/audio cycle (matches looped MP3)
       if (
@@ -1090,7 +1132,7 @@ async function runMerge() {
       subtitleVtt = chunksToVtt(chunks);
       subChunkCount = chunks.length;
       appendLog(
-        `語音稿字幕：${built.source} · ${subChunkCount} 句 · cycle ${timeline.cycleDur.toFixed(1)}s · 「${(built.text || '').slice(0, 80)}」`,
+        `語音稿字幕：${built.source} · ${subChunkCount} 句 · 第一句@${(chunks[0]?.timestamp?.[0] ?? 0).toFixed(2)}s · 「${(built.text || '').slice(0, 80)}」`,
       );
       if (!subtitleSrt.trim()) throw new Error('語音稿未能產生有效字幕');
       setProgress(mergeRangeStart, '開始合併影片…');
