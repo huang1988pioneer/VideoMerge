@@ -537,7 +537,9 @@ export function detectSpeechBounds(mono, sampleRate, opts = {}) {
 }
 
 /**
- * Band-pass filter mono audio to approximate vocal / singing range (~280–3400 Hz).
+ * Band-pass filter mono audio to focus on vocal / singing range (~350–4500 Hz).
+ * Uses steeper HP cutoff to reject kick/bass and a peaking EQ at ~2.5 kHz to
+ * boost the most discriminating vocal formant (F2) region.
  * Skips bass intros and pure instrumental beds better than full-band RMS.
  * @param {Float32Array} mono
  * @param {number} sampleRate
@@ -550,32 +552,42 @@ async function filterVocalBand(mono, sampleRate) {
   const len = mono.length;
   const ctx = new OfflineCtx(1, len, sampleRate);
   const buffer = ctx.createBuffer(1, len, sampleRate);
-  // copyToChannel may not exist in all browsers
   const ch = buffer.getChannelData(0);
   ch.set(mono);
 
   const src = ctx.createBufferSource();
   src.buffer = buffer;
 
-  // Cascade HP + LP ≈ vocal/singing band (cut kick/bass & bright hats)
+  // Stage 1: HP @ 380 Hz — aggressively cuts kick drum (50–100 Hz) and bass guitar
   const hp = ctx.createBiquadFilter();
   hp.type = 'highpass';
-  hp.frequency.value = 300;
-  hp.Q.value = 0.707;
+  hp.frequency.value = 380;
+  hp.Q.value = 0.9;
 
+  // Stage 2: HP @ 340 Hz (cascaded for steeper roll-off ~24 dB/oct below ~360 Hz)
   const hp2 = ctx.createBiquadFilter();
   hp2.type = 'highpass';
-  hp2.frequency.value = 250;
-  hp2.Q.value = 0.5;
+  hp2.frequency.value = 340;
+  hp2.Q.value = 0.6;
 
+  // Stage 3: Peaking EQ @ 2500 Hz — boosts vocal F2 formant region
+  // Human voice has strong energy here; most instruments are weaker at this freq.
+  const peak = ctx.createBiquadFilter();
+  peak.type = 'peaking';
+  peak.frequency.value = 2500;
+  peak.Q.value = 1.2;
+  peak.gain.value = 6; // +6 dB boost
+
+  // Stage 4: LP @ 4500 Hz — retains fricatives (s, sh, f sounds) but cuts hats
   const lp = ctx.createBiquadFilter();
   lp.type = 'lowpass';
-  lp.frequency.value = 3400;
+  lp.frequency.value = 4500;
   lp.Q.value = 0.707;
 
   src.connect(hp);
   hp.connect(hp2);
-  hp2.connect(lp);
+  hp2.connect(peak);
+  peak.connect(lp);
   lp.connect(ctx.destination);
   src.start(0);
 
