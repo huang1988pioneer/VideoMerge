@@ -11,16 +11,39 @@
 - 調整合併順序（上移 / 下移）
 - 一鍵合併為 MP4 並預覽、下載
 
-## 使用方式
+## 本機啟動
+
+**需求：** [Node.js](https://nodejs.org/) 18+（含 npm）
+
+### 方式一：一鍵腳本（建議）
+
+| 環境 | 指令 |
+|------|------|
+| **Linux / macOS / Git Bash** | `./start.sh` |
+| **Windows** | 雙擊 `start.bat`，或在終端機執行 `start.bat` |
+
+腳本會自動：
+1. 檢查 Node / npm  
+2. 若尚未安裝依賴則執行 `npm install`  
+3. 啟動開發伺服器並嘗試開啟瀏覽器（預設 `http://localhost:5173`）
+
+自訂埠號：
+
+```bash
+PORT=3000 ./start.sh          # bash
+set PORT=3000 && start.bat    # Windows cmd
+```
+
+### 方式二：npm
 
 ```bash
 npm install
+npm start          # 等同開發伺服器 + 自動開瀏覽器
+# 或
 npm run dev
 ```
 
-瀏覽器開啟終端機顯示的本機網址（通常是 `http://localhost:5173`）。
-
-建置：
+### 建置預覽
 
 ```bash
 npm run build
