@@ -7,7 +7,43 @@ let transcriber = null;
 /** @type {Promise<unknown> | null} */
 let loadPromise = null;
 
-const MODEL_ID = 'Xenova/whisper-tiny';
+/**
+ * Prefer models/dtypes that work with current onnxruntime-web.
+ * q8-only Whisper often fails with:
+ *   TransposeDQWeightsForMatMulNBits Missing required scale ...
+ */
+const LOAD_CANDIDATES = [
+  // Full precision: largest but most compatible on WASM
+  {
+    model: 'Xenova/whisper-tiny',
+    options: { dtype: 'fp32', device: 'wasm' },
+    label: 'whisper-tiny fp32',
+  },
+  // Mixed: encoder lighter, decoder full (Whisper is sensitive to encoder quant)
+  {
+    model: 'Xenova/whisper-tiny',
+    options: {
+      dtype: {
+        encoder_model: 'fp32',
+        decoder_model_merged: 'fp32',
+      },
+      device: 'wasm',
+    },
+    label: 'whisper-tiny encoder/decoder fp32',
+  },
+  // Default pipeline (no dtype) — let library pick a safe variant
+  {
+    model: 'Xenova/whisper-tiny',
+    options: { device: 'wasm' },
+    label: 'whisper-tiny default',
+  },
+  // Community export fallback
+  {
+    model: 'onnx-community/whisper-tiny',
+    options: { dtype: 'fp32', device: 'wasm' },
+    label: 'onnx-community/whisper-tiny fp32',
+  },
+];
 
 /**
  * @param {(msg: string) => void} [onStatus]
@@ -18,40 +54,64 @@ export async function ensureTranscriber(onStatus, onProgress) {
   if (loadPromise) return loadPromise;
 
   loadPromise = (async () => {
-    onStatus?.('載入語音辨識模型（首次約需下載數十 MB）…');
+    onStatus?.('載入語音辨識模型（首次約需下載，請保持網路連線）…');
     const { pipeline, env } = await import('@huggingface/transformers');
 
-    // Browser: allow remote model weights
+    // Browser: allow remote model weights; cache successful downloads
     env.allowLocalModels = false;
     env.useBrowserCache = true;
 
-    const asr = await pipeline('automatic-speech-recognition', MODEL_ID, {
-      // q8 is smaller/faster in browser
-      dtype: 'q8',
-      device: 'wasm',
-      progress_callback: (p) => {
-        if (p?.status === 'progress' && typeof p.progress === 'number') {
-          onProgress?.(Math.min(0.95, p.progress / 100));
-          onStatus?.(`下載模型：${p.file || ''} ${Math.round(p.progress)}%`);
-        } else if (p?.status === 'done') {
-          onStatus?.(`模型就緒：${p.file || ''}`);
-        }
-      },
-    });
+    const progress_callback = (p) => {
+      if (p?.status === 'progress' && typeof p.progress === 'number') {
+        onProgress?.(Math.min(0.95, p.progress / 100));
+        const name = p.file ? String(p.file).split('/').pop() : '';
+        onStatus?.(`下載模型：${name} ${Math.round(p.progress)}%`);
+      } else if (p?.status === 'done' && p.file) {
+        onStatus?.(`模型檔就緒：${String(p.file).split('/').pop()}`);
+      }
+    };
 
-    transcriber = asr;
-    onProgress?.(1);
-    onStatus?.('語音辨識模型載入完成');
-    return asr;
+    const errors = [];
+    for (const candidate of LOAD_CANDIDATES) {
+      try {
+        onStatus?.(`嘗試載入：${candidate.label}…`);
+        const asr = await pipeline(
+          'automatic-speech-recognition',
+          candidate.model,
+          {
+            ...candidate.options,
+            progress_callback,
+          },
+        );
+        transcriber = asr;
+        onProgress?.(1);
+        onStatus?.(`語音辨識模型載入完成（${candidate.label}）`);
+        return asr;
+      } catch (err) {
+        const msg = err?.message || String(err);
+        errors.push(`${candidate.label}: ${msg}`);
+        onStatus?.(`載入失敗（${candidate.label}），改試下一組…`);
+        // continue
+      }
+    }
+
+    throw new Error(
+      [
+        '無法載入 Whisper 模型。',
+        '請確認網路可連到 Hugging Face，並用 Ctrl+F5 強制重新整理後再試。',
+        '若先前下載過損壞的 q8 模型，可清除本站快取後重試。',
+        errors.join(' | '),
+      ].join(' '),
+    );
   })();
 
   try {
     return await loadPromise;
   } catch (err) {
     loadPromise = null;
-    throw new Error(
-      `無法載入 Whisper 模型（需要網路）。${err?.message || err}`,
-    );
+    throw err instanceof Error
+      ? err
+      : new Error(`無法載入 Whisper 模型。${err?.message || err}`);
   }
 }
 

@@ -184,7 +184,7 @@ app.innerHTML = `
         </div>
         <p class="field-hint">
           勾選「不要聲音」時會忽略此音軌。音訊比影片短會循環，比影片長則裁到影片長度。
-          自動字幕使用瀏覽器內 Whisper，首次需下載模型；需已選擇 MP3。
+          自動字幕使用瀏覽器內 Whisper（fp32 相容模式），首次需下載模型；需已選擇 MP3。
         </p>
       </div>
     </section>
