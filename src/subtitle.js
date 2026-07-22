@@ -486,6 +486,153 @@ function parseAsrResult(result, audioDurationSec) {
   return chunks;
 }
 
+/** Manual slice length — small enough that WASM Whisper finishes in reasonable time */
+const SLICE_SEC = 15;
+const SLICE_OVERLAP_SEC = 0.5;
+/** Per-slice timeout (whisper-tiny on WASM: ~15s audio can take 30–90s) */
+const SLICE_TIMEOUT_MS = 90_000;
+/** Hard cap so jobs don't run forever */
+const MAX_ASR_SEC = 10 * 60;
+
+/**
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} label
+ * @returns {Promise<T>}
+ * @template T
+ */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(
+        new Error(
+          `${label} 逾時（>${Math.round(ms / 1000)} 秒）。瀏覽器內辨識較慢，請換較短 MP3 或稍後再試。`,
+        ),
+      );
+    }, ms);
+    promise.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
+function yieldToUi() {
+  return new Promise((resolve) => {
+    // Double rAF + timeout so status text actually paints before heavy WASM work
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => setTimeout(resolve, 0));
+    });
+  });
+}
+
+/**
+ * Run ASR on short slices with progress + timeout (avoids infinite hang on long files).
+ * @param {import('@huggingface/transformers').AutomaticSpeechRecognitionPipeline} asr
+ * @param {Float32Array} waveform
+ * @param {Record<string, unknown>} baseKwargs
+ * @param {{
+ *   onStatus?: (msg: string) => void,
+ *   onProgress?: (ratio: number) => void,
+ *   onLog?: (msg: string) => void,
+ * }} hooks
+ * @returns {Promise<SubChunk[]>}
+ */
+async function transcribeInSlices(asr, waveform, baseKwargs, hooks) {
+  const { onStatus, onProgress, onLog } = hooks;
+  const totalSec = waveform.length / SAMPLE_RATE;
+  const stepSec = SLICE_SEC - SLICE_OVERLAP_SEC;
+  const numSlices = Math.max(1, Math.ceil(totalSec / stepSec));
+  /** @type {SubChunk[]} */
+  const all = [];
+  const t0 = Date.now();
+
+  const heartbeat = setInterval(() => {
+    const elapsed = Math.round((Date.now() - t0) / 1000);
+    onStatus?.(
+      `辨識進行中…已 ${elapsed} 秒（瀏覽器內轉寫偏慢，請勿關閉分頁）`,
+    );
+  }, 2000);
+
+  try {
+    for (let i = 0; i < numSlices; i++) {
+      const startSec = i * stepSec;
+      const endSec = Math.min(totalSec, startSec + SLICE_SEC);
+      const startSample = Math.floor(startSec * SAMPLE_RATE);
+      const endSample = Math.min(waveform.length, Math.floor(endSec * SAMPLE_RATE));
+      if (endSample <= startSample) continue;
+
+      const slice = waveform.subarray(startSample, endSample);
+      const sliceDur = (endSample - startSample) / SAMPLE_RATE;
+      const elapsed = Math.round((Date.now() - t0) / 1000);
+
+      onStatus?.(
+        `辨識 ${i + 1}/${numSlices}（${startSec.toFixed(0)}–${endSec.toFixed(0)}s / 共 ${totalSec.toFixed(0)}s）· 已 ${elapsed}s`,
+      );
+      onProgress?.(0.1 + (0.85 * i) / numSlices);
+      onLog?.(
+        `ASR 片段 ${i + 1}/${numSlices}: ${startSec.toFixed(1)}–${endSec.toFixed(1)}s (${sliceDur.toFixed(1)}s, ${slice.length} samples)`,
+      );
+
+      // Let UI update before blocking WASM
+      await yieldToUi();
+
+      // No nested chunk_length_s — slice is already short
+      /** @type {Record<string, unknown>} */
+      const kwargs = {
+        ...baseKwargs,
+        return_timestamps: true,
+        // Cap generation so silence doesn't spin forever
+        max_new_tokens: 128,
+      };
+      delete kwargs.chunk_length_s;
+      delete kwargs.stride_length_s;
+
+      let result;
+      try {
+        result = await withTimeout(
+          asr(slice, kwargs),
+          SLICE_TIMEOUT_MS,
+          `第 ${i + 1}/${numSlices} 段`,
+        );
+      } catch (err) {
+        onLog?.(`片段 ${i + 1} 失敗：${err?.message || err}`);
+        // Continue other slices rather than abort entire job
+        continue;
+      }
+
+      const part = parseAsrResult(result, sliceDur);
+      for (const c of part) {
+        const [s, e] = c.timestamp;
+        // Skip cues fully inside overlap with previous slice (except first)
+        if (i > 0 && s < SLICE_OVERLAP_SEC * 0.8) continue;
+        all.push({
+          timestamp: [s + startSec, e + startSec],
+          text: c.text,
+        });
+      }
+
+      onLog?.(
+        `片段 ${i + 1} 完成：+${part.length} 句 · 累計 ${all.length} · 「${part.map((p) => p.text).join(' ').slice(0, 60)}」`,
+      );
+      onProgress?.(0.1 + (0.85 * (i + 1)) / numSlices);
+      await yieldToUi();
+    }
+  } finally {
+    clearInterval(heartbeat);
+  }
+
+  // Sort & light merge of adjacent identical lines
+  all.sort((a, b) => a.timestamp[0] - b.timestamp[0]);
+  return all;
+}
+
 /**
  * Transcribe an audio File (e.g. MP3) into timed subtitle chunks.
  * @param {File} file
@@ -502,71 +649,55 @@ export async function transcribeAudioToSubtitles(file, opts = {}) {
   if (!file) throw new Error('請先選擇 MP3 / 音訊檔');
 
   const lang = normalizeLanguage(language);
-  const preferChinese = !lang || lang === 'chinese';
 
+  // Prefer tiny for speed — base is often too slow in-browser and feels "stuck"
   const asr = await ensureTranscriber(onStatus, onProgress, {
-    preferBetterChinese: preferChinese,
+    preferBetterChinese: false,
   });
 
   onStatus?.('解碼音訊…');
   onLog?.(`ASR 檔案：${file.name}（${file.size} bytes） language=${lang || 'auto'}`);
 
-  const waveform = await decodeAudioForWhisper(file, onLog);
-  const audioDurationSec = waveform.length / SAMPLE_RATE;
+  let waveform = await decodeAudioForWhisper(file, onLog);
+  let audioDurationSec = waveform.length / SAMPLE_RATE;
   onLog?.(`波形長度 ${audioDurationSec.toFixed(2)}s · model=${loadedModelId || '?'}`);
 
-  onStatus?.('正在辨識語音內容（可能需數十秒）…');
-  onProgress?.(0.15);
+  if (audioDurationSec > MAX_ASR_SEC) {
+    onLog?.(
+      `音訊 ${audioDurationSec.toFixed(0)}s 超過上限 ${MAX_ASR_SEC}s，只辨識前 ${MAX_ASR_SEC / 60} 分鐘`,
+    );
+    onStatus?.(`音訊較長，僅辨識前 ${MAX_ASR_SEC / 60} 分鐘…`);
+    waveform = waveform.subarray(0, Math.floor(MAX_ASR_SEC * SAMPLE_RATE));
+    audioDurationSec = waveform.length / SAMPLE_RATE;
+  }
 
   /** @type {Record<string, unknown>} */
-  const kwargs = {
+  const baseKwargs = {
     return_timestamps: true,
-    chunk_length_s: 30,
-    stride_length_s: 5,
+    max_new_tokens: 128,
   };
   if (lang) {
-    kwargs.language = lang;
-    kwargs.task = 'transcribe';
+    baseKwargs.language = lang;
+    baseKwargs.task = 'transcribe';
   }
 
-  // Pass raw waveform — more reliable than blob URL for local files
-  let result;
-  try {
-    result = await asr(waveform, kwargs);
-  } catch (err) {
-    onLog?.(`ASR 第一次失敗：${err?.message || err}，改試 URL 輸入…`);
-    const url = URL.createObjectURL(file);
-    try {
-      result = await asr(url, kwargs);
-    } finally {
-      URL.revokeObjectURL(url);
-    }
-  }
+  onStatus?.('開始分段辨識（每段約 15 秒音訊）…');
+  onProgress?.(0.1);
 
-  onProgress?.(0.9);
-  onLog?.(`ASR 原始回傳：${JSON.stringify(result)?.slice(0, 400) || typeof result}`);
+  const chunks = await transcribeInSlices(asr, waveform, baseKwargs, {
+    onStatus,
+    onProgress,
+    onLog,
+  });
 
-  let chunks = parseAsrResult(result, audioDurationSec);
   const fullText = chunks.map((c) => c.text).join(' ').trim();
-  onLog?.(`解析後 ${chunks.length} 句，文字：${fullText.slice(0, 120)}${fullText.length > 120 ? '…' : ''}`);
-
-  // If tiny produced nothing useful for Chinese, try base once
-  if (!chunks.length && preferChinese && loadedModelId && !loadedModelId.includes('base')) {
-    onStatus?.('tiny 無結果，改載入 whisper-base 重試…');
-    transcriber = null;
-    loadedModelId = null;
-    loadPromise = null;
-    const asr2 = await ensureTranscriber(onStatus, onProgress, {
-      preferBetterChinese: true,
-    });
-    result = await asr2(waveform, kwargs);
-    chunks = parseAsrResult(result, audioDurationSec);
-    onLog?.(`base 重試：${chunks.length} 句`);
-  }
+  onLog?.(
+    `解析後 ${chunks.length} 句，文字：${fullText.slice(0, 120)}${fullText.length > 120 ? '…' : ''}`,
+  );
 
   if (!chunks.length) {
     throw new Error(
-      '未能從音訊辨識出文字。請確認：① MP3 含清楚人聲 ② 語言選對 ③ 音量足夠。純音樂通常無法產生字幕。',
+      '未能從音訊辨識出文字。請確認：① MP3 含清楚人聲 ② 語言選對 ③ 音量足夠。純音樂通常無法產生字幕。若各段都逾時，請換較短 MP3 再試。',
     );
   }
 
