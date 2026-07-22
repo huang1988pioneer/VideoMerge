@@ -391,6 +391,11 @@ body {
   padding-top: var(--space-1);
 }
 
+/* display:flex 會蓋掉原生 [hidden]，必須明確隱藏 */
+.extend-fields[hidden] {
+  display: none !important;
+}
+
 .field-row {
   display: flex;
   flex-wrap: wrap;

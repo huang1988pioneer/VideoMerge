@@ -256,7 +256,7 @@ function syncExtendUI() {
 
   if (mode === 'once') {
     els.extendEstimate.textContent =
-      base > 0 ? `輸出約 ${baseLabel}（播一次）` : '可依次數或目標時長自動重複並裁切';
+      base > 0 ? `輸出約 ${baseLabel}` : '選擇重複次數或目標時長可自動延長';
     return;
   }
 
