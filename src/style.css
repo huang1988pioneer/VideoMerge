@@ -1042,6 +1042,26 @@ body {
   opacity: 0.5;
 }
 
+.script-sync-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.script-sync-row .field-select,
+.script-sync-row input[type='number'] {
+  width: 5.5rem;
+  min-width: 5.5rem;
+  max-width: 6rem;
+}
+
+.script-sync-hint {
+  flex: 1;
+  min-width: 12rem;
+  margin: 0;
+}
+
 .result-video {
   width: 100%;
   max-height: 360px;

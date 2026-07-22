@@ -8,6 +8,8 @@ import {
   chunksToVtt,
   transcribeAudioToSubtitles,
   scriptToSubtitles,
+  resolveSubtitleTimeline,
+  shiftChunks,
 } from './subtitle.js';
 
 /** @typedef {{
@@ -213,8 +215,26 @@ app.innerHTML = `
           rows="6"
           placeholder="在此貼上語音稿（純文字）。也支援已有時間軸的 SRT / VTT，或 [00:01-00:03] 字幕 格式。&#10;&#10;範例：&#10;大家好，歡迎收看本期節目。&#10;今天我們來介紹影片合併功能。"
         ></textarea>
+        <div class="script-sync-row">
+          <label class="field field-inline" for="sub-offset" title="正數：字幕延後；負數：字幕提前">
+            <span class="field-label">字幕偏移（秒）</span>
+            <input
+              type="number"
+              id="sub-offset"
+              class="field-select"
+              value="0"
+              step="0.1"
+              min="-30"
+              max="30"
+              inputmode="decimal"
+            />
+          </label>
+          <span class="field-hint script-sync-hint">
+            有 MP3 時以<strong>音軌一輪</strong>對齊稿件，影片較長會自動循環字幕；不同步可微調偏移。
+          </span>
+        </div>
         <p class="field-hint">
-          純文字會依標點／換行切句，並依字數比例分配到整段影片時長。若同時勾選「自動辨識」，將優先使用語音稿。
+          純文字依標點／換行切句，並依語速比例對齊音軌（非整段影片硬切）。有時間軸的 SRT 最準。若同時勾選「自動辨識」，將優先使用語音稿。
         </p>
       </div>
     </section>
@@ -311,6 +331,7 @@ const els = {
   btnLoadScript: document.getElementById('btn-load-script'),
   btnClearScript: document.getElementById('btn-clear-script'),
   scriptHint: document.getElementById('script-hint'),
+  subOffset: document.getElementById('sub-offset'),
   resultTrack: document.getElementById('result-track'),
   btnDownloadSrt: document.getElementById('btn-download-srt'),
   subsResultHint: document.getElementById('subs-result-hint'),
@@ -474,6 +495,7 @@ function syncAudioUI() {
   if (els.scriptText) els.scriptText.disabled = merging;
   if (els.btnLoadScript) els.btnLoadScript.disabled = merging;
   if (els.btnClearScript) els.btnClearScript.disabled = merging || !hasScript;
+  if (els.subOffset) els.subOffset.disabled = merging;
   if (els.scriptHint) {
     if (hasScript) {
       const n = els.scriptText.value.trim().length;
@@ -948,53 +970,66 @@ async function runMerge() {
 
     if (wantScriptSubs) {
       setProgress(0.05, '依語音稿產生字幕…');
-      appendLog('使用語音稿上字幕（不跑 Whisper）');
+      appendLog('使用語音稿上字幕（對齊音軌／影片時軸）');
 
-      // Duration basis: target video length, fallback audio, fallback sum of clips
-      let durationSec = estimateOutputDurationSec();
-      if (!(durationSec > 0) && bgm) {
-        try {
-          durationSec = await getMediaDuration(bgm);
-        } catch {
-          /* ignore */
-        }
-      }
-      if (!(durationSec > 0)) {
-        durationSec = ready.reduce(
+      let videoDur = estimateOutputDurationSec();
+      if (!(videoDur > 0)) {
+        videoDur = ready.reduce(
           (s, c) => s + (Number.isFinite(c.duration) && c.duration > 0 ? c.duration : 0),
           0,
         );
       }
-      if (!(durationSec > 0.5)) {
+      let audioDur = 0;
+      if (bgm) {
+        try {
+          audioDur = await getMediaDuration(bgm);
+        } catch {
+          audioDur = 0;
+        }
+      }
+      if (!(videoDur > 0.5) && audioDur > 0.5) videoDur = audioDur;
+      if (!(videoDur > 0.5)) {
         throw new Error('無法估算影片時長，請先加入至少一段有效影片');
       }
 
-      const built = scriptToSubtitles(scriptRaw, durationSec);
+      // Key sync fix: time script to one audio cycle, then tile if video loops audio
+      const timeline = resolveSubtitleTimeline({
+        videoDur,
+        audioDur,
+        hasCustomAudio: Boolean(bgm),
+      });
+      appendLog(
+        `字幕時軸：mode=${timeline.mode} cycle=${timeline.cycleDur.toFixed(2)}s total=${timeline.totalDur.toFixed(2)}s` +
+          (audioDur ? ` audio=${audioDur.toFixed(2)}s` : '') +
+          ` video=${videoDur.toFixed(2)}s`,
+      );
+
+      const built = scriptToSubtitles(scriptRaw, timeline.cycleDur);
       let chunks = built.chunks;
 
-      // If BGM shorter/longer and video loops, tile cues to full video duration
-      try {
-        if (bgm) {
-          const audioDur = await getMediaDuration(bgm);
-          if (audioDur > 0 && durationSec > audioDur + 0.25 && built.source === 'script') {
-            // For plain script we already timed to full video duration — no tile
-          } else if (
-            built.source === 'timed' &&
-            audioDur > 0 &&
-            durationSec > audioDur + 0.25
-          ) {
-            chunks = tileChunksToDuration(chunks, audioDur, durationSec);
-          }
-        }
-      } catch (e) {
-        appendLog(`語音稿時長對齊略過：${e?.message || e}`);
+      // Tile when video is longer than one speech/audio cycle (matches looped MP3)
+      if (
+        timeline.totalDur > timeline.cycleDur + 0.25 &&
+        timeline.cycleDur > 0.2
+      ) {
+        chunks = tileChunksToDuration(chunks, timeline.cycleDur, timeline.totalDur);
+        appendLog(
+          `字幕循環對齊：${timeline.cycleDur.toFixed(1)}s → ${timeline.totalDur.toFixed(1)}s，句數 ${chunks.length}`,
+        );
+      }
+
+      // User fine-tune offset (seconds): positive = delay subs
+      const offsetSec = Number(els.subOffset?.value);
+      if (Number.isFinite(offsetSec) && offsetSec !== 0) {
+        chunks = shiftChunks(chunks, offsetSec, timeline.totalDur);
+        appendLog(`字幕偏移：${offsetSec > 0 ? '+' : ''}${offsetSec}s`);
       }
 
       subtitleSrt = chunksToSrt(chunks);
       subtitleVtt = chunksToVtt(chunks);
       subChunkCount = chunks.length;
       appendLog(
-        `語音稿字幕：${built.source} · ${subChunkCount} 句 · 時長 ${durationSec.toFixed(1)}s · 「${(built.text || '').slice(0, 80)}」`,
+        `語音稿字幕：${built.source} · ${subChunkCount} 句 · cycle ${timeline.cycleDur.toFixed(1)}s · 「${(built.text || '').slice(0, 80)}」`,
       );
       if (!subtitleSrt.trim()) throw new Error('語音稿未能產生有效字幕');
       setProgress(mergeRangeStart, '開始合併影片…');
@@ -1023,23 +1058,29 @@ async function runMerge() {
       }
       try {
         const audioDur = await getMediaDuration(bgm);
-        const videoDur = estimateOutputDurationSec();
-        if (videoDur > 0 && audioDur > 0) {
-          chunks = tileChunksToDuration(chunks, audioDur, videoDur);
+        const videoDur = estimateOutputDurationSec() || audioDur;
+        const timeline = resolveSubtitleTimeline({
+          videoDur,
+          audioDur,
+          hasCustomAudio: true,
+        });
+        if (timeline.totalDur > timeline.cycleDur + 0.25) {
+          chunks = tileChunksToDuration(chunks, timeline.cycleDur, timeline.totalDur);
           appendLog(
-            `字幕對齊：音訊 ${audioDur.toFixed(1)}s → 影片約 ${videoDur.toFixed(1)}s，句數 ${chunks.length}`,
+            `字幕對齊：音訊 ${timeline.cycleDur.toFixed(1)}s → 影片 ${timeline.totalDur.toFixed(1)}s，句數 ${chunks.length}`,
           );
+        }
+        const offsetSec = Number(els.subOffset?.value);
+        if (Number.isFinite(offsetSec) && offsetSec !== 0) {
+          chunks = shiftChunks(chunks, offsetSec, timeline.totalDur);
+          appendLog(`字幕偏移：${offsetSec > 0 ? '+' : ''}${offsetSec}s`);
         }
       } catch (e) {
         appendLog(`字幕時長對齊略過：${e?.message || e}`);
       }
 
-      subtitleSrt = asr.srt || chunksToSrt(chunks);
-      subtitleVtt = asr.vtt || chunksToVtt(chunks);
-      if (chunks !== asr.chunks) {
-        subtitleSrt = chunksToSrt(chunks);
-        subtitleVtt = chunksToVtt(chunks);
-      }
+      subtitleSrt = chunksToSrt(chunks);
+      subtitleVtt = chunksToVtt(chunks);
       subChunkCount = chunks.length;
       if (!subtitleSrt.trim()) {
         throw new Error('SRT 內容為空，字幕產生失敗');

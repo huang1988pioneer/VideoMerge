@@ -453,20 +453,59 @@ export function parseTimedScript(raw) {
 }
 
 /**
- * Build timed subtitles from plain script + total duration (weighted by text length).
+ * Shift all cue times by delta seconds (can be negative). Clamps start >= 0.
+ * @param {SubChunk[]} chunks
+ * @param {number} deltaSec
+ * @param {number} [maxEndSec] clamp ends to this duration if provided
+ * @returns {SubChunk[]}
+ */
+export function shiftChunks(chunks, deltaSec, maxEndSec) {
+  const d = Number(deltaSec) || 0;
+  if (!d && maxEndSec == null) return chunks;
+  /** @type {SubChunk[]} */
+  const out = [];
+  for (const c of chunks) {
+    let s = c.timestamp[0] + d;
+    let e = c.timestamp[1] + d;
+    if (Number.isFinite(maxEndSec)) {
+      if (s >= maxEndSec) continue;
+      e = Math.min(e, maxEndSec);
+    }
+    if (s < 0) {
+      e += -s; // keep length when clamping start
+      s = 0;
+    }
+    if (e <= s) e = s + 0.4;
+    out.push({ timestamp: [s, e], text: c.text });
+  }
+  return out;
+}
+
+/**
+ * Build timed subtitles from plain script + speech-cycle duration.
+ * Uses speaking-rate model (CJK ~3.2 weight-units/sec), then scale-to-fit
+ * the target duration so the last cue ends with the audio/video cycle.
+ *
  * @param {string} scriptText
- * @param {number} durationSec
+ * @param {number} durationSec  One speech cycle (usually MP3 length, else video)
  * @param {{
  *   minCueSec?: number,
  *   maxCueSec?: number,
  *   gapSec?: number,
+ *   charsPerSec?: number,
+ *   leadInSec?: number,
+ *   leadOutSec?: number,
  * }} [opts]
  * @returns {{ chunks: SubChunk[], srt: string, vtt: string, text: string, source: 'timed' | 'script' }}
  */
 export function scriptToSubtitles(scriptText, durationSec, opts = {}) {
-  const minCueSec = opts.minCueSec ?? 1.0;
-  const maxCueSec = opts.maxCueSec ?? 8.0;
-  const gapSec = opts.gapSec ?? 0.08;
+  const minCueSec = opts.minCueSec ?? 0.85;
+  const maxCueSec = opts.maxCueSec ?? 7.5;
+  const gapSec = opts.gapSec ?? 0.06;
+  // Spoken Chinese ≈ 3–4 chars/s; weight units ≈ similar for CJK
+  const charsPerSec = opts.charsPerSec ?? 3.2;
+  const leadInSec = opts.leadInSec ?? 0.12;
+  const leadOutSec = opts.leadOutSec ?? 0.15;
 
   const timed = parseTimedScript(scriptText);
   if (timed?.length) {
@@ -490,39 +529,55 @@ export function scriptToSubtitles(scriptText, durationSec, opts = {}) {
   }
 
   const weights = lines.map((l) => scriptWeight(l));
-  const totalW = weights.reduce((a, b) => a + b, 0) || 1;
+  // Ideal durations from speaking rate
+  let ideals = weights.map((w) => {
+    const ideal = w / charsPerSec;
+    return Math.min(maxCueSec, Math.max(minCueSec, ideal));
+  });
+  const gapsTotal = Math.max(0, lines.length - 1) * gapSec;
+  const lead = leadInSec + leadOutSec;
+  let sumIdeal = ideals.reduce((a, b) => a + b, 0) + gapsTotal + lead;
 
-  // Available time for cues (leave tiny tail margin)
-  const usable = Math.max(dur - 0.05, lines.length * minCueSec * 0.5);
-  /** @type {SubChunk[]} */
-  const chunks = [];
-  let t = 0;
-
-  for (let i = 0; i < lines.length; i++) {
-    const share = (weights[i] / totalW) * usable;
-    let len = Math.min(maxCueSec, Math.max(minCueSec, share));
-    // Last cue stretches to end
-    if (i === lines.length - 1) {
-      len = Math.max(minCueSec, dur - t);
-    } else if (t + len > dur - (lines.length - i - 1) * minCueSec) {
-      len = Math.max(minCueSec, (dur - t) / (lines.length - i));
-    }
-    let end = Math.min(dur, t + len);
-    if (end <= t) end = Math.min(dur, t + minCueSec);
-    chunks.push({ timestamp: [t, end], text: lines[i] });
-    t = end + (i < lines.length - 1 ? gapSec : 0);
-    if (t >= dur && i < lines.length - 1) {
-      // Compress remaining into leftover — rare
-      break;
+  // Scale to fit available duration (keeps relative pacing of speech)
+  const usable = Math.max(dur - 0.02, lines.length * minCueSec * 0.4);
+  if (sumIdeal > 1e-6) {
+    const scale = (usable - gapsTotal - lead) / (sumIdeal - gapsTotal - lead);
+    if (Number.isFinite(scale) && scale > 0) {
+      ideals = ideals.map((x) =>
+        Math.min(maxCueSec, Math.max(minCueSec * 0.7, x * scale)),
+      );
     }
   }
 
-  // If we stopped early due to time, append rest into last cue text
-  if (chunks.length < lines.length && chunks.length) {
-    const rest = lines.slice(chunks.length).join(' ');
-    const last = chunks[chunks.length - 1];
-    last.text = `${last.text} ${rest}`.trim();
-    last.timestamp[1] = dur;
+  // Re-normalize if still over/under
+  let sumCues = ideals.reduce((a, b) => a + b, 0);
+  const targetCues = Math.max(usable - gapsTotal - lead, lines.length * minCueSec * 0.5);
+  if (sumCues > 1e-6) {
+    const s2 = targetCues / sumCues;
+    ideals = ideals.map((x) => Math.max(0.5, x * s2));
+  }
+
+  /** @type {SubChunk[]} */
+  const chunks = [];
+  let t = leadInSec;
+  for (let i = 0; i < lines.length; i++) {
+    let len = ideals[i];
+    if (i === lines.length - 1) {
+      // Snap last cue end to cycle end (minus lead-out)
+      const endTarget = Math.max(t + minCueSec, dur - leadOutSec);
+      len = endTarget - t;
+    }
+    let end = t + len;
+    if (end > dur) end = dur;
+    if (end <= t) end = Math.min(dur, t + 0.5);
+    chunks.push({ timestamp: [t, end], text: lines[i] });
+    t = end + (i < lines.length - 1 ? gapSec : 0);
+  }
+
+  // Ensure last ends at duration (audio/video cycle end)
+  if (chunks.length) {
+    chunks[0].timestamp[0] = Math.max(0, chunks[0].timestamp[0]);
+    chunks[chunks.length - 1].timestamp[1] = dur;
   }
 
   return {
@@ -531,6 +586,51 @@ export function scriptToSubtitles(scriptText, durationSec, opts = {}) {
     vtt: chunksToVtt(chunks),
     text: lines.join(' '),
     source: 'script',
+  };
+}
+
+/**
+ * Resolve how to time subtitles against video + optional custom audio.
+ * Custom audio is looped to video length in merge (-stream_loop -1 -shortest),
+ * so one speech cycle = min(audio, video) or audio if video longer with loop.
+ *
+ * @param {{
+ *   videoDur: number,
+ *   audioDur?: number | null,
+ *   hasCustomAudio?: boolean,
+ * }} p
+ * @returns {{ cycleDur: number, totalDur: number, mode: string }}
+ */
+export function resolveSubtitleTimeline(p) {
+  const videoDur = Math.max(0, Number(p.videoDur) || 0);
+  const audioDur = Math.max(0, Number(p.audioDur) || 0);
+  const hasAudio = Boolean(p.hasCustomAudio) && audioDur > 0.2;
+
+  if (!hasAudio) {
+    return {
+      cycleDur: videoDur,
+      totalDur: videoDur,
+      mode: 'video-only',
+    };
+  }
+
+  // Final mux: video length wins; audio loops if shorter, cut if longer.
+  const totalDur = videoDur > 0.2 ? videoDur : audioDur;
+
+  if (audioDur <= totalDur + 0.15) {
+    // Speech cycle = full audio; tile subtitles when video longer
+    return {
+      cycleDur: audioDur,
+      totalDur,
+      mode: 'audio-cycle-tile',
+    };
+  }
+
+  // Audio longer than video → audio is cut at video end; time to video
+  return {
+    cycleDur: totalDur,
+    totalDur,
+    mode: 'audio-trimmed-to-video',
   };
 }
 
