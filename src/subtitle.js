@@ -295,6 +295,246 @@ function formatTimestamp(sec, style) {
  */
 
 /**
+ * Character weight for timing (CJK counts as 1, latin ~0.5, space low).
+ * @param {string} text
+ */
+export function scriptWeight(text) {
+  let w = 0;
+  for (const ch of text) {
+    if (/\s/.test(ch)) w += 0.15;
+    else if (/[\u3400-\u9fff\uF900-\uFAFF]/.test(ch)) w += 1;
+    else if (/[0-9]/.test(ch)) w += 0.6;
+    else w += 0.45;
+  }
+  return Math.max(0.5, w);
+}
+
+/**
+ * Split plain script into subtitle lines (Chinese/English punctuation + newlines).
+ * If text looks like SRT/VTT, returns null (caller should parse timed format).
+ * @param {string} raw
+ * @returns {string[]}
+ */
+export function splitScriptIntoLines(raw) {
+  const text = String(raw || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .trim();
+  if (!text) return [];
+
+  // Already timed? leave to parseTimedScript
+  if (
+    /^WEBVTT/i.test(text) ||
+    /^\d+\s*\n\d{1,2}:\d{2}/m.test(text) ||
+    /\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}\s*-->\s*/.test(text)
+  ) {
+    return null;
+  }
+
+  // Prefer explicit line breaks first
+  const byLine = text
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  // If user wrote one long paragraph, split on sentence ends
+  const lines = [];
+  for (const line of byLine) {
+    // Keep short lines as-is
+    if (line.length <= 40 || !/[。！？!?.；;]/.test(line)) {
+      lines.push(line);
+      continue;
+    }
+    // Split but keep delimiter with previous clause
+    const parts = line.split(/(?<=[。！？!?.；;])\s*/).map((p) => p.trim()).filter(Boolean);
+    if (parts.length <= 1) {
+      lines.push(line);
+    } else {
+      for (const p of parts) {
+        // Further split very long clauses
+        if (p.length > 48) {
+          let buf = '';
+          for (const ch of p) {
+            buf += ch;
+            if (buf.length >= 36 && /[，,、\s]/.test(ch)) {
+              lines.push(buf.trim());
+              buf = '';
+            }
+          }
+          if (buf.trim()) lines.push(buf.trim());
+        } else {
+          lines.push(p);
+        }
+      }
+    }
+  }
+
+  return lines.filter(Boolean);
+}
+
+/**
+ * Parse user-provided SRT or simple timed lines into chunks.
+ * Supports:
+ *  - Standard SRT
+ *  - WebVTT
+ *  - Lines like: [00:01.00-00:03.50] 字幕文字
+ *  - Lines like: 00:01 --> 00:03 字幕
+ * @param {string} raw
+ * @returns {SubChunk[] | null}
+ */
+export function parseTimedScript(raw) {
+  const text = String(raw || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .trim();
+  if (!text) return null;
+
+  /** @type {SubChunk[]} */
+  const chunks = [];
+
+  const toSec = (h, m, s, ms) => {
+    const frac = ms != null ? Number(`0.${String(ms).padEnd(3, '0').slice(0, 3)}`) : 0;
+    return (
+      (Number(h) || 0) * 3600 +
+      (Number(m) || 0) * 60 +
+      (Number(s) || 0) +
+      frac
+    );
+  };
+
+  const parseTs = (str) => {
+    const t = str.trim().replace(',', '.');
+    let m = t.match(/^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?$/);
+    if (m) return toSec(m[1] || 0, m[2], m[3], m[4]);
+    m = t.match(/^(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?$/);
+    if (m) return toSec(0, m[1], m[2], m[3]);
+    m = t.match(/^(\d+(?:\.\d+)?)$/);
+    if (m) return Number(m[1]);
+    return NaN;
+  };
+
+  // SRT / VTT blocks with -->
+  if (/\d{1,2}:\d{2}.*-->/.test(text) || /^WEBVTT/i.test(text)) {
+    const body = text.replace(/^WEBVTT[^\n]*\n+/i, '');
+    const blocks = body.split(/\n\s*\n/);
+    for (const block of blocks) {
+      const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+      if (!lines.length) continue;
+      const timeLine = lines.find((l) => l.includes('-->'));
+      if (!timeLine) continue;
+      const [a, b] = timeLine.split('-->').map((x) => x.trim());
+      const start = parseTs(a.split(/\s+/)[0]);
+      const end = parseTs(b.split(/\s+/)[0]);
+      const cueText = lines
+        .filter((l) => l !== timeLine && !/^\d+$/.test(l))
+        .join('\n')
+        .trim();
+      if (cueText && Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        chunks.push({ timestamp: [start, end], text: cueText });
+      }
+    }
+    return chunks.length ? chunks : null;
+  }
+
+  // [mm:ss-mm:ss] text  or  [0:01.0-0:03.0] text
+  const bracketRe =
+    /^\[?\s*(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?|\d+(?:\.\d+)?)\s*[-–—~]\s*(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?|\d+(?:\.\d+)?)\s*\]?\s*(.+)$/;
+  for (const line of text.split('\n')) {
+    const m = line.trim().match(bracketRe);
+    if (!m) continue;
+    const start = parseTs(m[1]);
+    const end = parseTs(m[2]);
+    const cue = m[3].trim();
+    if (cue && Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      chunks.push({ timestamp: [start, end], text: cue });
+    }
+  }
+  return chunks.length ? chunks : null;
+}
+
+/**
+ * Build timed subtitles from plain script + total duration (weighted by text length).
+ * @param {string} scriptText
+ * @param {number} durationSec
+ * @param {{
+ *   minCueSec?: number,
+ *   maxCueSec?: number,
+ *   gapSec?: number,
+ * }} [opts]
+ * @returns {{ chunks: SubChunk[], srt: string, vtt: string, text: string, source: 'timed' | 'script' }}
+ */
+export function scriptToSubtitles(scriptText, durationSec, opts = {}) {
+  const minCueSec = opts.minCueSec ?? 1.0;
+  const maxCueSec = opts.maxCueSec ?? 8.0;
+  const gapSec = opts.gapSec ?? 0.08;
+
+  const timed = parseTimedScript(scriptText);
+  if (timed?.length) {
+    return {
+      chunks: timed,
+      srt: chunksToSrt(timed),
+      vtt: chunksToVtt(timed),
+      text: timed.map((c) => c.text).join(' '),
+      source: 'timed',
+    };
+  }
+
+  const lines = splitScriptIntoLines(scriptText);
+  if (!lines.length) {
+    throw new Error('語音稿是空的，請貼上或上傳文字稿');
+  }
+
+  const dur = Number(durationSec);
+  if (!Number.isFinite(dur) || dur <= 0.5) {
+    throw new Error('無法取得影片／音訊時長，請先加入影片（或選擇音軌）再上字幕');
+  }
+
+  const weights = lines.map((l) => scriptWeight(l));
+  const totalW = weights.reduce((a, b) => a + b, 0) || 1;
+
+  // Available time for cues (leave tiny tail margin)
+  const usable = Math.max(dur - 0.05, lines.length * minCueSec * 0.5);
+  /** @type {SubChunk[]} */
+  const chunks = [];
+  let t = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const share = (weights[i] / totalW) * usable;
+    let len = Math.min(maxCueSec, Math.max(minCueSec, share));
+    // Last cue stretches to end
+    if (i === lines.length - 1) {
+      len = Math.max(minCueSec, dur - t);
+    } else if (t + len > dur - (lines.length - i - 1) * minCueSec) {
+      len = Math.max(minCueSec, (dur - t) / (lines.length - i));
+    }
+    let end = Math.min(dur, t + len);
+    if (end <= t) end = Math.min(dur, t + minCueSec);
+    chunks.push({ timestamp: [t, end], text: lines[i] });
+    t = end + (i < lines.length - 1 ? gapSec : 0);
+    if (t >= dur && i < lines.length - 1) {
+      // Compress remaining into leftover — rare
+      break;
+    }
+  }
+
+  // If we stopped early due to time, append rest into last cue text
+  if (chunks.length < lines.length && chunks.length) {
+    const rest = lines.slice(chunks.length).join(' ');
+    const last = chunks[chunks.length - 1];
+    last.text = `${last.text} ${rest}`.trim();
+    last.timestamp[1] = dur;
+  }
+
+  return {
+    chunks,
+    srt: chunksToSrt(chunks),
+    vtt: chunksToVtt(chunks),
+    text: lines.join(' '),
+    source: 'script',
+  };
+}
+
+/**
  * @param {SubChunk[]} chunks
  * @returns {string}
  */

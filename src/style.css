@@ -995,6 +995,53 @@ body {
   word-break: break-word;
 }
 
+/* —— Script / 語音稿 —— */
+.script-panel {
+  margin-top: var(--space-4);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.script-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.script-textarea {
+  width: 100%;
+  min-height: 8rem;
+  resize: vertical;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.script-textarea::placeholder {
+  color: var(--faint);
+}
+
+.script-textarea:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  border-color: transparent;
+}
+
+.script-textarea:disabled {
+  opacity: 0.5;
+}
+
 .result-video {
   width: 100%;
   max-height: 360px;

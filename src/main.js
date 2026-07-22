@@ -7,6 +7,7 @@ import {
   chunksToSrt,
   chunksToVtt,
   transcribeAudioToSubtitles,
+  scriptToSubtitles,
 } from './subtitle.js';
 
 /** @typedef {{
@@ -173,9 +174,9 @@ app.innerHTML = `
           <span class="audio-name" id="audio-name">未選擇音訊</span>
         </div>
         <div class="audio-sub-row">
-          <label class="opt-check" for="opt-auto-subs" title="依 MP3 語音自動產生字幕（需網路下載模型）">
+          <label class="opt-check" for="opt-auto-subs" title="依 MP3 語音自動產生字幕（需網路下載模型，較慢）">
             <input type="checkbox" id="opt-auto-subs" />
-            <span>依音軌自動字幕</span>
+            <span>依音軌自動辨識字幕</span>
           </label>
           <label class="field field-inline" for="sub-lang">
             <span class="field-label">辨識語言</span>
@@ -188,7 +189,32 @@ app.innerHTML = `
         </div>
         <p class="field-hint">
           勾選「不要聲音」時會忽略此音軌。音訊比影片短會循環，比影片長則裁到影片長度。
-          自動字幕使用瀏覽器內 Whisper（分段辨識，狀態會顯示進度）。模型僅首次下載並快取；長 MP3 較慢屬正常，請勿關閉分頁。
+          「依音軌自動辨識」需下載 Whisper 模型，較慢；有現成講稿時建議用下方語音稿。
+        </p>
+      </div>
+
+      <div class="script-panel" aria-labelledby="script-title">
+        <div class="extend-head">
+          <h3 id="script-title">語音稿字幕</h3>
+          <p class="hint" id="script-hint">貼上講稿後，依影片時長自動切句上字幕（免下載模型）</p>
+        </div>
+        <div class="script-toolbar">
+          <label class="opt-check" for="opt-script-subs" title="使用下方語音稿產生字幕">
+            <input type="checkbox" id="opt-script-subs" />
+            <span>使用語音稿上字幕</span>
+          </label>
+          <input type="file" id="script-file" accept=".txt,.srt,.vtt,text/plain" hidden />
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-load-script">上傳稿件</button>
+          <button type="button" class="btn btn-danger btn-sm" id="btn-clear-script" disabled>清除稿件</button>
+        </div>
+        <textarea
+          id="script-text"
+          class="script-textarea"
+          rows="6"
+          placeholder="在此貼上語音稿（純文字）。也支援已有時間軸的 SRT / VTT，或 [00:01-00:03] 字幕 格式。&#10;&#10;範例：&#10;大家好，歡迎收看本期節目。&#10;今天我們來介紹影片合併功能。"
+        ></textarea>
+        <p class="field-hint">
+          純文字會依標點／換行切句，並依字數比例分配到整段影片時長。若同時勾選「自動辨識」，將優先使用語音稿。
         </p>
       </div>
     </section>
@@ -279,6 +305,12 @@ const els = {
   audioHint: document.getElementById('audio-hint'),
   optAutoSubs: document.getElementById('opt-auto-subs'),
   subLang: document.getElementById('sub-lang'),
+  optScriptSubs: document.getElementById('opt-script-subs'),
+  scriptText: document.getElementById('script-text'),
+  scriptFile: document.getElementById('script-file'),
+  btnLoadScript: document.getElementById('btn-load-script'),
+  btnClearScript: document.getElementById('btn-clear-script'),
+  scriptHint: document.getElementById('script-hint'),
   resultTrack: document.getElementById('result-track'),
   btnDownloadSrt: document.getElementById('btn-download-srt'),
   subsResultHint: document.getElementById('subs-result-hint'),
@@ -436,9 +468,27 @@ function syncAudioUI() {
   const canSubs = Boolean(audioFile) && !muted;
   els.optAutoSubs.disabled = merging || !canSubs;
   els.subLang.disabled = merging || !canSubs || !els.optAutoSubs.checked;
-  if (!canSubs && els.optAutoSubs.checked) {
-    // keep checked state but disabled — user sees intent; merge will skip if no audio
+
+  const hasScript = Boolean(els.scriptText?.value?.trim());
+  if (els.optScriptSubs) els.optScriptSubs.disabled = merging;
+  if (els.scriptText) els.scriptText.disabled = merging;
+  if (els.btnLoadScript) els.btnLoadScript.disabled = merging;
+  if (els.btnClearScript) els.btnClearScript.disabled = merging || !hasScript;
+  if (els.scriptHint) {
+    if (hasScript) {
+      const n = els.scriptText.value.trim().length;
+      els.scriptHint.textContent = els.optScriptSubs?.checked
+        ? `將使用語音稿上字幕（${n} 字）`
+        : `已輸入稿件 ${n} 字 — 勾選「使用語音稿上字幕」即可套用`;
+    } else {
+      els.scriptHint.textContent =
+        '貼上講稿後，依影片時長自動切句上字幕（免下載模型）';
+    }
   }
+}
+
+function getScriptText() {
+  return (els.scriptText?.value || '').trim();
 }
 
 function setAudioFile(file) {
@@ -860,10 +910,17 @@ async function runMerge() {
     const noAudio = Boolean(els.optNoAudio.checked);
     const loop = getLoopOptions();
     const bgm = !noAudio && audioFile instanceof File ? audioFile : null;
-    const wantSubs = Boolean(els.optAutoSubs.checked) && Boolean(bgm);
+    const scriptRaw = getScriptText();
+    const wantScriptSubs = Boolean(els.optScriptSubs?.checked) && Boolean(scriptRaw);
+    const wantAsrSubs = Boolean(els.optAutoSubs.checked) && Boolean(bgm);
+    // Script takes priority when both checked
+    const wantSubs = wantScriptSubs || wantAsrSubs;
 
-    if (els.optAutoSubs.checked && !bgm) {
-      throw new Error('自動字幕需要先選擇 MP3 音軌（且勿勾選「不要聲音」）');
+    if (els.optScriptSubs?.checked && !scriptRaw) {
+      throw new Error('已勾選語音稿字幕，請先貼上或上傳講稿');
+    }
+    if (els.optAutoSubs.checked && !bgm && !wantScriptSubs) {
+      throw new Error('自動辨識字幕需要先選擇 MP3 音軌（且勿勾選「不要聲音」）');
     }
 
     if (loop.mode === 'count') {
@@ -886,10 +943,62 @@ async function runMerge() {
     let subtitleVtt = null;
     let subChunkCount = 0;
 
-    // ASR occupies 0–22% of bar; FFmpeg merge uses remaining 22–100%
+    // Script/ASR prep occupies 0–22% of bar; FFmpeg merge uses remaining
     const mergeRangeStart = wantSubs ? 0.22 : 0;
 
-    if (wantSubs) {
+    if (wantScriptSubs) {
+      setProgress(0.05, '依語音稿產生字幕…');
+      appendLog('使用語音稿上字幕（不跑 Whisper）');
+
+      // Duration basis: target video length, fallback audio, fallback sum of clips
+      let durationSec = estimateOutputDurationSec();
+      if (!(durationSec > 0) && bgm) {
+        try {
+          durationSec = await getMediaDuration(bgm);
+        } catch {
+          /* ignore */
+        }
+      }
+      if (!(durationSec > 0)) {
+        durationSec = ready.reduce(
+          (s, c) => s + (Number.isFinite(c.duration) && c.duration > 0 ? c.duration : 0),
+          0,
+        );
+      }
+      if (!(durationSec > 0.5)) {
+        throw new Error('無法估算影片時長，請先加入至少一段有效影片');
+      }
+
+      const built = scriptToSubtitles(scriptRaw, durationSec);
+      let chunks = built.chunks;
+
+      // If BGM shorter/longer and video loops, tile cues to full video duration
+      try {
+        if (bgm) {
+          const audioDur = await getMediaDuration(bgm);
+          if (audioDur > 0 && durationSec > audioDur + 0.25 && built.source === 'script') {
+            // For plain script we already timed to full video duration — no tile
+          } else if (
+            built.source === 'timed' &&
+            audioDur > 0 &&
+            durationSec > audioDur + 0.25
+          ) {
+            chunks = tileChunksToDuration(chunks, audioDur, durationSec);
+          }
+        }
+      } catch (e) {
+        appendLog(`語音稿時長對齊略過：${e?.message || e}`);
+      }
+
+      subtitleSrt = chunksToSrt(chunks);
+      subtitleVtt = chunksToVtt(chunks);
+      subChunkCount = chunks.length;
+      appendLog(
+        `語音稿字幕：${built.source} · ${subChunkCount} 句 · 時長 ${durationSec.toFixed(1)}s · 「${(built.text || '').slice(0, 80)}」`,
+      );
+      if (!subtitleSrt.trim()) throw new Error('語音稿未能產生有效字幕');
+      setProgress(mergeRangeStart, '開始合併影片…');
+    } else if (wantAsrSubs) {
       setProgress(0.02, '語音辨識中…');
       const lang = els.subLang.value || 'chinese';
       const asr = await transcribeAudioToSubtitles(bgm, {
@@ -909,7 +1018,7 @@ async function runMerge() {
       );
       if (!chunks.length || !(asr.text || '').trim()) {
         throw new Error(
-          '語音辨識沒有產生任何文字。請確認 MP3 有清楚人聲，並將語言設為「中文」或「自動偵測」。',
+          '語音辨識沒有產生任何文字。也可改用「語音稿字幕」貼上講稿。',
         );
       }
       try {
@@ -927,7 +1036,6 @@ async function runMerge() {
 
       subtitleSrt = asr.srt || chunksToSrt(chunks);
       subtitleVtt = asr.vtt || chunksToVtt(chunks);
-      // Re-build if tiles changed timestamps
       if (chunks !== asr.chunks) {
         subtitleSrt = chunksToSrt(chunks);
         subtitleVtt = chunksToVtt(chunks);
@@ -1035,7 +1143,11 @@ async function runMerge() {
       els.btnDownloadCollapsed.download = els.btnDownload.download;
     }
     toast(
-      wantSubs ? '合併完成（含自動字幕）' : '合併完成，可預覽或下載',
+      wantSubs
+        ? wantScriptSubs
+          ? '合併完成（含語音稿字幕）'
+          : '合併完成（含自動辨識字幕）'
+        : '合併完成，可預覽或下載',
       'success',
     );
     els.resultBlock.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -1094,7 +1206,48 @@ els.optAutoSubs.addEventListener('change', () => {
     els.optNoAudio.checked = false;
     toast('已關閉「不要聲音」以便產生字幕');
   }
+  if (els.optAutoSubs.checked && els.optScriptSubs?.checked) {
+    toast('已同時勾選語音稿：合併時將優先使用語音稿', 'info');
+  }
   syncAudioUI();
+});
+
+els.optScriptSubs.addEventListener('change', () => {
+  if (els.optScriptSubs.checked && !getScriptText()) {
+    toast('請先貼上或上傳語音稿', 'error');
+    // still allow check; merge will validate
+    els.scriptText?.focus();
+  }
+  syncAudioUI();
+});
+
+els.scriptText.addEventListener('input', () => {
+  if (els.scriptText.value.trim() && !els.optScriptSubs.checked) {
+    // gentle: don't auto-check; just update hint
+  }
+  syncAudioUI();
+});
+
+els.btnLoadScript.addEventListener('click', () => els.scriptFile.click());
+els.scriptFile.addEventListener('change', async () => {
+  const f = els.scriptFile.files?.[0];
+  els.scriptFile.value = '';
+  if (!f) return;
+  try {
+    const text = await f.text();
+    els.scriptText.value = text;
+    els.optScriptSubs.checked = true;
+    syncAudioUI();
+    toast(`已載入稿件：${f.name}`, 'success');
+  } catch (err) {
+    toast(err?.message || '讀取稿件失敗', 'error');
+  }
+});
+els.btnClearScript.addEventListener('click', () => {
+  els.scriptText.value = '';
+  els.optScriptSubs.checked = false;
+  syncAudioUI();
+  toast('已清除語音稿');
 });
 
 document.querySelectorAll('input[name="loop-mode"]').forEach((el) => {
