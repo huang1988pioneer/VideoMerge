@@ -219,9 +219,9 @@ app.innerHTML = `
           placeholder="在此貼上語音稿（純文字）。也支援已有時間軸的 SRT / VTT，或 [00:01-00:03] 字幕 格式。&#10;&#10;範例：&#10;大家好，歡迎收看本期節目。&#10;今天我們來介紹影片合併功能。"
         ></textarea>
         <div class="script-sync-row">
-          <label class="opt-check" for="opt-auto-offset" title="偵測 MP3 開頭人聲後才開始上字幕">
+          <label class="opt-check" for="opt-auto-offset" title="略過前奏音樂，偵測歌聲／人聲後才開始上字幕">
             <input type="checkbox" id="opt-auto-offset" checked />
-            <span>有人聲再上字幕</span>
+            <span>歌聲開始再上字幕</span>
           </label>
           <label class="field field-inline" for="sub-offset" title="正數：字幕延後；負數：字幕提前">
             <span class="field-label">手動偏移（秒）</span>
@@ -237,7 +237,7 @@ app.innerHTML = `
             />
           </label>
           <span class="field-hint script-sync-hint" id="offset-hint">
-            開頭靜音不上字幕；偵測到 MP3 人聲後才開始，可再手動微調秒數。
+            MP3 前奏音樂不上字幕；偵測到歌聲／人聲後才開始，可再手動微調。
           </span>
         </div>
         <p class="field-hint">
@@ -512,13 +512,13 @@ function syncAudioUI() {
   if (els.offsetHint) {
     if (!audioFile) {
       els.offsetHint.textContent =
-        '「有人聲再上字幕」需要 MP3；僅影片時請用手動偏移。';
+        '「歌聲開始再上字幕」需要 MP3；僅影片時請用手動偏移。';
     } else if (els.optAutoOffset?.checked) {
       els.offsetHint.textContent =
-        '已啟用：開頭靜音不上字，有人聲才開始字幕；右側可再微調秒數。';
+        '已啟用：前奏樂器不上字，偵測到歌聲／人聲才開始；可再手動微調。';
     } else {
       els.offsetHint.textContent =
-        '手動模式：正數延後、負數提前。建議勾選「有人聲再上字幕」。';
+        '手動模式：正數延後、負數提前。建議勾選「歌聲開始再上字幕」。';
     }
   }
   if (els.scriptHint) {
@@ -1074,7 +1074,7 @@ async function runMerge() {
 
       // Default: wait for voice before first subtitle (needs MP3)
       if (els.optAutoOffset?.checked && bgm) {
-        setProgress(0.06, '偵測人聲，字幕將從有聲音後開始…');
+        setProgress(0.06, '偵測歌聲／人聲（略過前奏音樂）…');
         try {
           const speech = await detectAudioSpeechOnset(bgm, appendLog);
           built = scriptToSubtitlesFromSpeechStart(scriptRaw, {
@@ -1084,7 +1084,7 @@ async function runMerge() {
           });
           chunks = built.chunks;
           appendLog(
-            `字幕策略：開頭靜音不上字，自 ${speech.onsetSec.toFixed(2)}s 人聲起開始（至 ${speech.endSec.toFixed(2)}s）`,
+            `字幕策略：前奏不上字，自 ${speech.onsetSec.toFixed(2)}s 歌聲／人聲起（至 ${speech.endSec.toFixed(2)}s，${speech.method || ''}）`,
           );
           // Manual fine-tune only
           const manual = getManualOffsetSec();
@@ -1093,7 +1093,7 @@ async function runMerge() {
             appendLog(`手動微調偏移：${manual > 0 ? '+' : ''}${manual}s`);
           }
           if (els.offsetHint) {
-            els.offsetHint.textContent = `字幕自 ${speech.onsetSec.toFixed(2)}s 起（偵測到人聲）`;
+            els.offsetHint.textContent = `字幕自 ${speech.onsetSec.toFixed(2)}s 起（偵測到歌聲／人聲）`;
           }
         } catch (e) {
           appendLog(`人聲偵測失敗，改一般排程：${e?.message || e}`);
@@ -1363,7 +1363,7 @@ els.optScriptSubs.addEventListener('change', () => {
 
 els.optAutoOffset.addEventListener('change', () => {
   if (els.optAutoOffset.checked && !audioFile) {
-    toast('「有人聲再上字幕」需要先選擇 MP3 音軌', 'error');
+    toast('「歌聲開始再上字幕」需要先選擇 MP3 音軌', 'error');
   }
   syncAudioUI();
 });

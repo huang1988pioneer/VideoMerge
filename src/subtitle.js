@@ -453,24 +453,27 @@ export function parseTimedScript(raw) {
 }
 
 /**
- * Detect when speech/energy starts in a mono waveform.
+ * RMS bounds on a mono waveform (energy only — may trigger on instruments).
  * @param {Float32Array} mono
  * @param {number} sampleRate
  * @param {{
  *   frameMs?: number,
  *   thresholdRatio?: number,
  *   minRunFrames?: number,
+ *   minOnsetSec?: number,
  * }} [opts]
  * @returns {{ onsetSec: number, endSec: number, peakRms: number }}
  */
 export function detectSpeechBounds(mono, sampleRate, opts = {}) {
-  const frameMs = opts.frameMs ?? 25;
-  const thresholdRatio = opts.thresholdRatio ?? 0.12;
-  const minRunFrames = opts.minRunFrames ?? 3;
+  const frameMs = opts.frameMs ?? 30;
+  const thresholdRatio = opts.thresholdRatio ?? 0.14;
+  const minRunFrames = opts.minRunFrames ?? 5; // ~150ms+ sustained
+  const minOnsetSec = opts.minOnsetSec ?? 0;
   const frameSize = Math.max(64, Math.floor((sampleRate * frameMs) / 1000));
   const nFrames = Math.floor(mono.length / frameSize);
+  const durationSec = mono.length / sampleRate;
   if (nFrames < 2) {
-    return { onsetSec: 0, endSec: mono.length / sampleRate, peakRms: 0 };
+    return { onsetSec: 0, endSec: durationSec, peakRms: 0 };
   }
 
   const rms = new Float32Array(nFrames);
@@ -487,13 +490,14 @@ export function detectSpeechBounds(mono, sampleRate, opts = {}) {
     if (r > peak) peak = r;
   }
 
-  // Noise floor: median of quieter half
   const sorted = Array.from(rms).sort((a, b) => a - b);
   const noise = sorted[Math.floor(sorted.length * 0.2)] || 0;
-  const thr = Math.max(peak * thresholdRatio, noise * 4, 0.008);
+  const thr = Math.max(peak * thresholdRatio, noise * 5, 0.006);
 
-  let onsetFrame = 0;
-  for (let f = 0; f < nFrames; f++) {
+  const startFrame = Math.floor((minOnsetSec * sampleRate) / frameSize);
+
+  let onsetFrame = startFrame;
+  for (let f = startFrame; f < nFrames; f++) {
     let ok = true;
     for (let k = 0; k < minRunFrames; k++) {
       if (f + k >= nFrames || rms[f + k] < thr) {
@@ -508,7 +512,7 @@ export function detectSpeechBounds(mono, sampleRate, opts = {}) {
   }
 
   let endFrame = nFrames - 1;
-  for (let f = nFrames - 1; f >= 0; f--) {
+  for (let f = nFrames - 1; f >= onsetFrame; f--) {
     let ok = true;
     for (let k = 0; k < minRunFrames; k++) {
       if (f - k < 0 || rms[f - k] < thr) {
@@ -523,31 +527,212 @@ export function detectSpeechBounds(mono, sampleRate, opts = {}) {
   }
 
   const onsetSec = (onsetFrame * frameSize) / sampleRate;
-  const endSec = Math.min(
-    mono.length / sampleRate,
-    ((endFrame + 1) * frameSize) / sampleRate,
-  );
+  const endSec = Math.min(durationSec, ((endFrame + 1) * frameSize) / sampleRate);
   return { onsetSec, endSec, peakRms: peak };
 }
 
 /**
- * Decode file and detect speech onset (seconds from start).
+ * Band-pass filter mono audio to approximate vocal / singing range (~280–3400 Hz).
+ * Skips bass intros and pure instrumental beds better than full-band RMS.
+ * @param {Float32Array} mono
+ * @param {number} sampleRate
+ * @returns {Promise<Float32Array>}
+ */
+async function filterVocalBand(mono, sampleRate) {
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!OfflineCtx) return mono;
+
+  const len = mono.length;
+  const ctx = new OfflineCtx(1, len, sampleRate);
+  const buffer = ctx.createBuffer(1, len, sampleRate);
+  // copyToChannel may not exist in all browsers
+  const ch = buffer.getChannelData(0);
+  ch.set(mono);
+
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+
+  // Cascade HP + LP ≈ vocal/singing band (cut kick/bass & bright hats)
+  const hp = ctx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 300;
+  hp.Q.value = 0.707;
+
+  const hp2 = ctx.createBiquadFilter();
+  hp2.type = 'highpass';
+  hp2.frequency.value = 250;
+  hp2.Q.value = 0.5;
+
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 3400;
+  lp.Q.value = 0.707;
+
+  src.connect(hp);
+  hp.connect(hp2);
+  hp2.connect(lp);
+  lp.connect(ctx.destination);
+  src.start(0);
+
+  const rendered = await ctx.startRendering();
+  return rendered.getChannelData(0).slice(0);
+}
+
+/**
+ * Per-frame vocal likelihood: mid-band energy + spectral flatness proxy.
+ * Returns onset of sustained "voice-like" activity (singing / speech), not just any music.
+ * @param {Float32Array} mono full-band
+ * @param {Float32Array} vocal mono vocal-filtered
+ * @param {number} sampleRate
+ * @returns {{ onsetSec: number, endSec: number, peakRms: number, method: string }}
+ */
+function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
+  const frameMs = 40;
+  const frameSize = Math.max(128, Math.floor((sampleRate * frameMs) / 1000));
+  const hop = Math.floor(frameSize / 2);
+  const nFrames = Math.max(1, Math.floor((mono.length - frameSize) / hop) + 1);
+
+  const fullRms = new Float32Array(nFrames);
+  const vocRms = new Float32Array(nFrames);
+  let peakV = 0;
+  let peakF = 0;
+
+  for (let f = 0; f < nFrames; f++) {
+    const base = f * hop;
+    let sf = 0;
+    let sv = 0;
+    for (let i = 0; i < frameSize; i++) {
+      const a = mono[base + i] || 0;
+      const b = vocal[base + i] || 0;
+      sf += a * a;
+      sv += b * b;
+    }
+    fullRms[f] = Math.sqrt(sf / frameSize);
+    vocRms[f] = Math.sqrt(sv / frameSize);
+    if (vocRms[f] > peakV) peakV = vocRms[f];
+    if (fullRms[f] > peakF) peakF = fullRms[f];
+  }
+
+  // Adaptive thresholds: need strong vocal-band presence relative to mix
+  const sortedV = Array.from(vocRms).sort((a, b) => a - b);
+  const noiseV = sortedV[Math.floor(sortedV.length * 0.25)] || 0;
+  const thrV = Math.max(peakV * 0.18, noiseV * 6, 0.004);
+
+  // Sustained singing ~ 250–400ms (not a snare hit)
+  const minRun = Math.max(4, Math.round(280 / frameMs));
+  // Vocal ratio: voice-band / full — instruments-only intros often have lower ratio mid-song vocals higher
+  const minRatio = 0.22;
+
+  let onsetFrame = -1;
+  for (let f = 0; f < nFrames; f++) {
+    let ok = 0;
+    for (let k = 0; k < minRun; k++) {
+      const i = f + k;
+      if (i >= nFrames) break;
+      const ratio = fullRms[i] > 1e-6 ? vocRms[i] / fullRms[i] : 0;
+      if (vocRms[i] >= thrV && ratio >= minRatio) ok += 1;
+    }
+    if (ok >= minRun) {
+      onsetFrame = f;
+      break;
+    }
+  }
+
+  // Fallback: pure vocal-band energy (still better than full-band bass)
+  if (onsetFrame < 0) {
+    const loose = detectSpeechBounds(vocal, sampleRate, {
+      frameMs: 35,
+      thresholdRatio: 0.16,
+      minRunFrames: Math.max(4, Math.round(250 / 35)),
+    });
+    return {
+      onsetSec: loose.onsetSec,
+      endSec: loose.endSec,
+      peakRms: peakV,
+      method: 'vocal-band-energy',
+    };
+  }
+
+  let endFrame = nFrames - 1;
+  for (let f = nFrames - 1; f >= onsetFrame; f--) {
+    let ok = 0;
+    for (let k = 0; k < minRun; k++) {
+      const i = f - k;
+      if (i < 0) break;
+      const ratio = fullRms[i] > 1e-6 ? vocRms[i] / fullRms[i] : 0;
+      if (vocRms[i] >= thrV * 0.7 && ratio >= minRatio * 0.8) ok += 1;
+    }
+    if (ok >= minRun) {
+      endFrame = f;
+      break;
+    }
+  }
+
+  const onsetSec = (onsetFrame * hop) / sampleRate;
+  const endSec = Math.min(
+    mono.length / sampleRate,
+    ((endFrame * hop + frameSize) / sampleRate),
+  );
+
+  return {
+    onsetSec,
+    endSec,
+    peakRms: peakV,
+    method: 'vocal-ratio',
+  };
+}
+
+/**
+ * Decode file and detect singing/speech onset (skips pure instrumental intros).
  * @param {File | Blob} file
  * @param {(msg: string) => void} [onLog]
- * @returns {Promise<{ onsetSec: number, endSec: number, durationSec: number }>}
+ * @returns {Promise<{ onsetSec: number, endSec: number, durationSec: number, method?: string }>}
  */
 export async function detectAudioSpeechOnset(file, onLog) {
   const wave = await decodeAudioForWhisper(file, onLog);
-  // decodeAudioForWhisper returns 16k mono
-  const bounds = detectSpeechBounds(wave, SAMPLE_RATE);
   const durationSec = wave.length / SAMPLE_RATE;
+
+  onLog?.('分析人聲／歌聲頻段（略過前奏樂器）…');
+  let vocal = wave;
+  try {
+    vocal = await filterVocalBand(wave, SAMPLE_RATE);
+  } catch (e) {
+    onLog?.(`人聲濾波失敗，改用全頻：${e?.message || e}`);
+  }
+
+  const bounds = detectVocalOnsetFromBands(wave, vocal, SAMPLE_RATE);
+
+  // If "onset" is almost at 0 but intro is loud music, try stricter second pass
+  // starting after a short ignore window when early frames are bass-heavy
+  if (bounds.onsetSec < 0.35 && durationSec > 5) {
+    const retry = detectSpeechBounds(vocal, SAMPLE_RATE, {
+      frameMs: 40,
+      thresholdRatio: 0.22,
+      minRunFrames: 8,
+      minOnsetSec: 0.4,
+    });
+    // Prefer later onset if much stronger sustained vocal later
+    if (retry.onsetSec > bounds.onsetSec + 0.8) {
+      onLog?.(
+        `前奏偏樂器，改採較晚歌聲起點 ${retry.onsetSec.toFixed(2)}s（原 ${bounds.onsetSec.toFixed(2)}s）`,
+      );
+      return {
+        onsetSec: retry.onsetSec,
+        endSec: retry.endSec,
+        durationSec,
+        method: 'vocal-late-pass',
+      };
+    }
+  }
+
   onLog?.(
-    `人聲起點≈${bounds.onsetSec.toFixed(2)}s · 終點≈${bounds.endSec.toFixed(2)}s · 峰值RMS=${bounds.peakRms.toFixed(4)}`,
+    `歌聲／人聲起點≈${bounds.onsetSec.toFixed(2)}s · 終點≈${bounds.endSec.toFixed(2)}s · 方法=${bounds.method}`,
   );
   return {
     onsetSec: bounds.onsetSec,
     endSec: bounds.endSec,
     durationSec,
+    method: bounds.method,
   };
 }
 
