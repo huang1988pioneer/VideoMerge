@@ -1,43 +1,38 @@
 /**
  * Speech-to-text (Whisper via Transformers.js) → SRT / WebVTT subtitles.
+ * Decodes local MP3 via Web Audio API (blob URL alone is unreliable for Whisper).
  */
 
 /** @type {import('@huggingface/transformers').AutomaticSpeechRecognitionPipeline | null} */
 let transcriber = null;
+/** @type {string | null} */
+let loadedModelId = null;
 /** @type {Promise<unknown> | null} */
 let loadPromise = null;
 
+const SAMPLE_RATE = 16000;
+
 /**
  * Prefer models/dtypes that work with current onnxruntime-web.
- * q8-only Whisper often fails with:
- *   TransposeDQWeightsForMatMulNBits Missing required scale ...
+ * q8-only Whisper often fails with TransposeDQWeightsForMatMulNBits.
+ * For Chinese speech, tiny is weak — include base as fallback after load.
  */
 const LOAD_CANDIDATES = [
-  // Full precision: largest but most compatible on WASM
   {
     model: 'Xenova/whisper-tiny',
     options: { dtype: 'fp32', device: 'wasm' },
     label: 'whisper-tiny fp32',
   },
-  // Mixed: encoder lighter, decoder full (Whisper is sensitive to encoder quant)
-  {
-    model: 'Xenova/whisper-tiny',
-    options: {
-      dtype: {
-        encoder_model: 'fp32',
-        decoder_model_merged: 'fp32',
-      },
-      device: 'wasm',
-    },
-    label: 'whisper-tiny encoder/decoder fp32',
-  },
-  // Default pipeline (no dtype) — let library pick a safe variant
   {
     model: 'Xenova/whisper-tiny',
     options: { device: 'wasm' },
     label: 'whisper-tiny default',
   },
-  // Community export fallback
+  {
+    model: 'Xenova/whisper-base',
+    options: { dtype: 'fp32', device: 'wasm' },
+    label: 'whisper-base fp32（中文較準）',
+  },
   {
     model: 'onnx-community/whisper-tiny',
     options: { dtype: 'fp32', device: 'wasm' },
@@ -48,16 +43,24 @@ const LOAD_CANDIDATES = [
 /**
  * @param {(msg: string) => void} [onStatus]
  * @param {(ratio: number) => void} [onProgress]
+ * @param {{ preferBetterChinese?: boolean }} [opts]
  */
-export async function ensureTranscriber(onStatus, onProgress) {
-  if (transcriber) return transcriber;
+export async function ensureTranscriber(onStatus, onProgress, opts = {}) {
+  if (transcriber && loadedModelId) return transcriber;
   if (loadPromise) return loadPromise;
+
+  const preferBase = Boolean(opts.preferBetterChinese);
+  const order = preferBase
+    ? [
+        ...LOAD_CANDIDATES.filter((c) => c.model.includes('base')),
+        ...LOAD_CANDIDATES.filter((c) => !c.model.includes('base')),
+      ]
+    : LOAD_CANDIDATES;
 
   loadPromise = (async () => {
     onStatus?.('載入語音辨識模型（首次約需下載，請保持網路連線）…');
     const { pipeline, env } = await import('@huggingface/transformers');
 
-    // Browser: allow remote model weights; cache successful downloads
     env.allowLocalModels = false;
     env.useBrowserCache = true;
 
@@ -72,7 +75,7 @@ export async function ensureTranscriber(onStatus, onProgress) {
     };
 
     const errors = [];
-    for (const candidate of LOAD_CANDIDATES) {
+    for (const candidate of order) {
       try {
         onStatus?.(`嘗試載入：${candidate.label}…`);
         const asr = await pipeline(
@@ -84,6 +87,7 @@ export async function ensureTranscriber(onStatus, onProgress) {
           },
         );
         transcriber = asr;
+        loadedModelId = candidate.model;
         onProgress?.(1);
         onStatus?.(`語音辨識模型載入完成（${candidate.label}）`);
         return asr;
@@ -91,7 +95,6 @@ export async function ensureTranscriber(onStatus, onProgress) {
         const msg = err?.message || String(err);
         errors.push(`${candidate.label}: ${msg}`);
         onStatus?.(`載入失敗（${candidate.label}），改試下一組…`);
-        // continue
       }
     }
 
@@ -99,7 +102,6 @@ export async function ensureTranscriber(onStatus, onProgress) {
       [
         '無法載入 Whisper 模型。',
         '請確認網路可連到 Hugging Face，並用 Ctrl+F5 強制重新整理後再試。',
-        '若先前下載過損壞的 q8 模型，可清除本站快取後重試。',
         errors.join(' | '),
       ].join(' '),
     );
@@ -112,6 +114,98 @@ export async function ensureTranscriber(onStatus, onProgress) {
     throw err instanceof Error
       ? err
       : new Error(`無法載入 Whisper 模型。${err?.message || err}`);
+  }
+}
+
+/**
+ * Decode File/Blob to mono Float32Array @ 16 kHz for Whisper.
+ * @param {File | Blob} file
+ * @param {(msg: string) => void} [onLog]
+ * @returns {Promise<Float32Array>}
+ */
+export async function decodeAudioForWhisper(file, onLog) {
+  if (!file) throw new Error('找不到音訊檔');
+
+  // 1) Preferred: Web Audio API (works with local File, MP3/WAV/M4A)
+  try {
+    const ab = await file.arrayBuffer();
+    if (!ab.byteLength) throw new Error('音訊檔是空的');
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) throw new Error('瀏覽器不支援 AudioContext');
+
+    const ctx = new AudioCtx();
+    let audioBuffer;
+    try {
+      // slice copy: decodeAudioData may detach the buffer
+      audioBuffer = await ctx.decodeAudioData(ab.slice(0));
+    } finally {
+      try {
+        await ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const { numberOfChannels, length, sampleRate } = audioBuffer;
+    onLog?.(
+      `音訊解碼：${(length / sampleRate).toFixed(1)}s · ${sampleRate}Hz · ${numberOfChannels}ch`,
+    );
+
+    // Mixdown to mono
+    const mono = new Float32Array(length);
+    for (let c = 0; c < numberOfChannels; c++) {
+      const ch = audioBuffer.getChannelData(c);
+      for (let i = 0; i < length; i++) mono[i] += ch[i] / numberOfChannels;
+    }
+
+    // RMS energy check (silence → empty ASR)
+    let sumSq = 0;
+    const step = Math.max(1, Math.floor(mono.length / 20000));
+    let n = 0;
+    for (let i = 0; i < mono.length; i += step) {
+      sumSq += mono[i] * mono[i];
+      n += 1;
+    }
+    const rms = Math.sqrt(sumSq / Math.max(1, n));
+    onLog?.(`音量 RMS≈${rms.toFixed(5)}`);
+    if (rms < 1e-4) {
+      throw new Error(
+        '音訊幾乎無聲（或解碼失敗）。請確認 MP3 含人聲且音量正常。',
+      );
+    }
+
+    if (sampleRate === SAMPLE_RATE) return mono;
+
+    // Linear resample → 16 kHz
+    const newLength = Math.max(1, Math.round((length * SAMPLE_RATE) / sampleRate));
+    const out = new Float32Array(newLength);
+    const ratio = length / newLength;
+    for (let i = 0; i < newLength; i++) {
+      const src = i * ratio;
+      const i0 = Math.floor(src);
+      const i1 = Math.min(i0 + 1, length - 1);
+      const t = src - i0;
+      out[i] = mono[i0] * (1 - t) + mono[i1] * t;
+    }
+    onLog?.(`已重採樣至 ${SAMPLE_RATE} Hz（${out.length} samples）`);
+    return out;
+  } catch (err) {
+    onLog?.(`Web Audio 解碼失敗，改試 transformers.read_audio：${err?.message || err}`);
+  }
+
+  // 2) Fallback: transformers read_audio (fetch-based)
+  const url = URL.createObjectURL(file);
+  try {
+    const { read_audio } = await import('@huggingface/transformers');
+    const audio = await read_audio(url, SAMPLE_RATE);
+    if (!(audio instanceof Float32Array) || !audio.length) {
+      throw new Error('read_audio 回傳空資料');
+    }
+    onLog?.(`read_audio 成功：${audio.length} samples @ ${SAMPLE_RATE}Hz`);
+    return audio;
+  } finally {
+    URL.revokeObjectURL(url);
   }
 }
 
@@ -192,7 +286,7 @@ export async function getMediaDuration(file) {
   const url = URL.createObjectURL(file);
   try {
     const el = document.createElement(
-      file.type.startsWith('video/') ? 'video' : 'audio',
+      file.type?.startsWith('video/') ? 'video' : 'audio',
     );
     el.preload = 'metadata';
     el.src = url;
@@ -244,10 +338,88 @@ export function tileChunksToDuration(chunks, audioDurationSec, videoDurationSec)
       }
     }
     offset += audioDurationSec;
-    // safety
     if (offset > videoDurationSec + audioDurationSec * 2) break;
   }
   return out;
+}
+
+/**
+ * Normalize Whisper language option.
+ * @param {string | null | undefined} language
+ */
+function normalizeLanguage(language) {
+  if (!language || language === 'auto') return null;
+  const map = {
+    chinese: 'chinese',
+    zh: 'chinese',
+    'zh-tw': 'chinese',
+    'zh-cn': 'chinese',
+    中文: 'chinese',
+    english: 'english',
+    en: 'english',
+  };
+  const key = String(language).toLowerCase();
+  return map[key] || language;
+}
+
+/**
+ * Parse various ASR return shapes into chunks.
+ * @param {any} result
+ * @param {number} audioDurationSec
+ * @returns {SubChunk[]}
+ */
+function parseAsrResult(result, audioDurationSec) {
+  /** @type {SubChunk[]} */
+  const chunks = [];
+
+  const pushChunk = (text, start, end) => {
+    const t = String(text || '')
+      .replace(/\[.*?\]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!t) return;
+    // Whisper silence hallucinations
+    if (/^(\.|…|\.\.\.|♪|\[Music\]|\[音樂\]|thank you\.?|thanks for watching\.?)$/i.test(t)) {
+      return;
+    }
+    let s = Number(start);
+    let e = Number(end);
+    if (!Number.isFinite(s) || s < 0) s = 0;
+    if (!Number.isFinite(e) || e <= s) e = s + 1.5;
+    chunks.push({ timestamp: [s, e], text: t });
+  };
+
+  // Array of segment results
+  const list = Array.isArray(result) ? result : [result];
+  for (const item of list) {
+    if (!item) continue;
+    if (Array.isArray(item.chunks) && item.chunks.length) {
+      for (const c of item.chunks) {
+        const ts = c.timestamp;
+        const start = Array.isArray(ts) ? ts[0] : 0;
+        const end = Array.isArray(ts) ? ts[1] : start + 1.5;
+        pushChunk(c.text, start, end);
+      }
+    } else if (item.text) {
+      pushChunk(
+        item.text,
+        0,
+        Math.max(audioDurationSec || 2, 2),
+      );
+    }
+  }
+
+  // Fix null / overlapping ends
+  for (let i = 0; i < chunks.length; i++) {
+    let [s, e] = chunks[i].timestamp;
+    if (!Number.isFinite(e) || e <= s) {
+      const next = chunks[i + 1]?.timestamp?.[0];
+      e = Number.isFinite(next) && next > s ? next : s + 2;
+      chunks[i].timestamp = [s, e];
+    }
+  }
+
+  return chunks;
 }
 
 /**
@@ -259,76 +431,94 @@ export function tileChunksToDuration(chunks, audioDurationSec, videoDurationSec)
  *   onProgress?: (ratio: number) => void,
  *   onLog?: (msg: string) => void,
  * }} [opts]
- * @returns {Promise<{ chunks: SubChunk[], text: string, srt: string, vtt: string }>}
+ * @returns {Promise<{ chunks: SubChunk[], text: string, srt: string, vtt: string, modelId: string | null }>}
  */
 export async function transcribeAudioToSubtitles(file, opts = {}) {
   const { language = 'chinese', onStatus, onProgress, onLog } = opts;
   if (!file) throw new Error('請先選擇 MP3 / 音訊檔');
 
-  const asr = await ensureTranscriber(onStatus, onProgress);
-  onStatus?.('正在辨識語音內容…');
-  onLog?.(`ASR 檔案：${file.name}（${file.size} bytes） language=${language || 'auto'}`);
+  const lang = normalizeLanguage(language);
+  const preferChinese = !lang || lang === 'chinese';
 
-  const url = URL.createObjectURL(file);
-  try {
-    /** @type {Record<string, unknown>} */
-    const kwargs = {
-      return_timestamps: true,
-      chunk_length_s: 30,
-      stride_length_s: 5,
-    };
-    // Multilingual whisper: null/undefined = auto detect
-    if (language && language !== 'auto') {
-      kwargs.language = language;
-      kwargs.task = 'transcribe';
-    }
+  const asr = await ensureTranscriber(onStatus, onProgress, {
+    preferBetterChinese: preferChinese,
+  });
 
-    const result = await asr(url, kwargs);
-    onLog?.(`ASR 完成，文字長度 ${(result?.text || '').length}`);
+  onStatus?.('解碼音訊…');
+  onLog?.(`ASR 檔案：${file.name}（${file.size} bytes） language=${lang || 'auto'}`);
 
-    /** @type {SubChunk[]} */
-    let chunks = [];
-    if (Array.isArray(result?.chunks) && result.chunks.length) {
-      chunks = result.chunks
-        .map((c) => ({
-          timestamp: /** @type {[number, number]} */ (
-            Array.isArray(c.timestamp)
-              ? [c.timestamp[0] ?? 0, c.timestamp[1] ?? (c.timestamp[0] ?? 0) + 1.5]
-              : [0, 1.5]
-          ),
-          text: String(c.text || '').trim(),
-        }))
-        .filter((c) => c.text);
-    } else if (result?.text) {
-      // No timestamps — single cue for whole clip
-      const dur = await getMediaDuration(file);
-      chunks = [
-        {
-          timestamp: [0, Math.max(dur || 2, 2)],
-          text: String(result.text).trim(),
-        },
-      ];
-    }
+  const waveform = await decodeAudioForWhisper(file, onLog);
+  const audioDurationSec = waveform.length / SAMPLE_RATE;
+  onLog?.(`波形長度 ${audioDurationSec.toFixed(2)}s · model=${loadedModelId || '?'}`);
 
-    if (!chunks.length) {
-      throw new Error('未能從音訊辨識出文字，請確認 MP3 含有人聲且夠清晰');
-    }
+  onStatus?.('正在辨識語音內容（可能需數十秒）…');
+  onProgress?.(0.15);
 
-    // Fix null end timestamps from whisper
-    for (let i = 0; i < chunks.length; i++) {
-      let [s, e] = chunks[i].timestamp;
-      if (!Number.isFinite(e) || e <= s) {
-        const next = chunks[i + 1]?.timestamp?.[0];
-        e = Number.isFinite(next) ? next : s + 2;
-        chunks[i].timestamp = [s, e];
-      }
-    }
-
-    const srt = chunksToSrt(chunks);
-    const vtt = chunksToVtt(chunks);
-    onStatus?.(`字幕就緒（${chunks.length} 句）`);
-    return { chunks, text: result?.text || chunks.map((c) => c.text).join(' '), srt, vtt };
-  } finally {
-    URL.revokeObjectURL(url);
+  /** @type {Record<string, unknown>} */
+  const kwargs = {
+    return_timestamps: true,
+    chunk_length_s: 30,
+    stride_length_s: 5,
+  };
+  if (lang) {
+    kwargs.language = lang;
+    kwargs.task = 'transcribe';
   }
+
+  // Pass raw waveform — more reliable than blob URL for local files
+  let result;
+  try {
+    result = await asr(waveform, kwargs);
+  } catch (err) {
+    onLog?.(`ASR 第一次失敗：${err?.message || err}，改試 URL 輸入…`);
+    const url = URL.createObjectURL(file);
+    try {
+      result = await asr(url, kwargs);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  onProgress?.(0.9);
+  onLog?.(`ASR 原始回傳：${JSON.stringify(result)?.slice(0, 400) || typeof result}`);
+
+  let chunks = parseAsrResult(result, audioDurationSec);
+  const fullText = chunks.map((c) => c.text).join(' ').trim();
+  onLog?.(`解析後 ${chunks.length} 句，文字：${fullText.slice(0, 120)}${fullText.length > 120 ? '…' : ''}`);
+
+  // If tiny produced nothing useful for Chinese, try base once
+  if (!chunks.length && preferChinese && loadedModelId && !loadedModelId.includes('base')) {
+    onStatus?.('tiny 無結果，改載入 whisper-base 重試…');
+    transcriber = null;
+    loadedModelId = null;
+    loadPromise = null;
+    const asr2 = await ensureTranscriber(onStatus, onProgress, {
+      preferBetterChinese: true,
+    });
+    result = await asr2(waveform, kwargs);
+    chunks = parseAsrResult(result, audioDurationSec);
+    onLog?.(`base 重試：${chunks.length} 句`);
+  }
+
+  if (!chunks.length) {
+    throw new Error(
+      '未能從音訊辨識出文字。請確認：① MP3 含清楚人聲 ② 語言選對 ③ 音量足夠。純音樂通常無法產生字幕。',
+    );
+  }
+
+  const srt = chunksToSrt(chunks);
+  const vtt = chunksToVtt(chunks);
+  if (!srt.trim() || !vtt.includes('-->')) {
+    throw new Error('字幕檔產生失敗（內容為空）');
+  }
+
+  onStatus?.(`字幕就緒（${chunks.length} 句）`);
+  onProgress?.(1);
+  return {
+    chunks,
+    text: fullText || chunks.map((c) => c.text).join(' '),
+    srt,
+    vtt,
+    modelId: loadedModelId,
+  };
 }

@@ -242,6 +242,10 @@ app.innerHTML = `
             <button type="button" class="btn btn-ghost" id="btn-dismiss-result">收合預覽</button>
           </div>
           <p class="field-hint" id="subs-result-hint" hidden></p>
+          <div class="subs-preview" id="subs-preview" hidden>
+            <div class="subs-preview-head">辨識字幕預覽</div>
+            <pre class="subs-preview-body" id="subs-preview-body"></pre>
+          </div>
         </div>
       </div>
     </section>
@@ -278,6 +282,8 @@ const els = {
   resultTrack: document.getElementById('result-track'),
   btnDownloadSrt: document.getElementById('btn-download-srt'),
   subsResultHint: document.getElementById('subs-result-hint'),
+  subsPreview: document.getElementById('subs-preview'),
+  subsPreviewBody: document.getElementById('subs-preview-body'),
   clipsRoot: document.getElementById('clips-root'),
   clipsCount: document.getElementById('clips-count'),
   progressBlock: document.getElementById('progress-block'),
@@ -511,8 +517,31 @@ function showResultPreview() {
     els.resultTrack.hidden = false;
     els.resultTrack.src = lastVttUrl;
     els.resultTrack.default = true;
+    enableSubtitleTrack();
   }
   els.resultBlock.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/** Force HTML5 text track to actually show captions. */
+function enableSubtitleTrack() {
+  const video = els.resultVideo;
+  if (!video) return;
+  const apply = () => {
+    try {
+      const tracks = video.textTracks;
+      if (!tracks?.length) return;
+      for (let i = 0; i < tracks.length; i++) {
+        tracks[i].mode = i === 0 ? 'showing' : 'disabled';
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+  apply();
+  video.addEventListener('loadeddata', apply, { once: true });
+  // Some browsers populate TextTrack after a tick
+  setTimeout(apply, 200);
+  setTimeout(apply, 800);
 }
 
 /** Fully discard last result (new merge / clear all). */
@@ -542,6 +571,8 @@ function revokeResult() {
     els.subsResultHint.hidden = true;
     els.subsResultHint.textContent = '';
   }
+  if (els.subsPreview) els.subsPreview.hidden = true;
+  if (els.subsPreviewBody) els.subsPreviewBody.textContent = '';
   if (els.btnDownloadCollapsed) {
     els.btnDownloadCollapsed.removeAttribute('href');
   }
@@ -873,6 +904,14 @@ async function runMerge() {
       });
 
       let chunks = asr.chunks;
+      appendLog(
+        `辨識模型：${asr.modelId || '?'} · 原始 ${chunks.length} 句 · 「${(asr.text || '').slice(0, 80)}」`,
+      );
+      if (!chunks.length || !(asr.text || '').trim()) {
+        throw new Error(
+          '語音辨識沒有產生任何文字。請確認 MP3 有清楚人聲，並將語言設為「中文」或「自動偵測」。',
+        );
+      }
       try {
         const audioDur = await getMediaDuration(bgm);
         const videoDur = estimateOutputDurationSec();
@@ -886,9 +925,17 @@ async function runMerge() {
         appendLog(`字幕時長對齊略過：${e?.message || e}`);
       }
 
-      subtitleSrt = chunksToSrt(chunks);
-      subtitleVtt = chunksToVtt(chunks);
+      subtitleSrt = asr.srt || chunksToSrt(chunks);
+      subtitleVtt = asr.vtt || chunksToVtt(chunks);
+      // Re-build if tiles changed timestamps
+      if (chunks !== asr.chunks) {
+        subtitleSrt = chunksToSrt(chunks);
+        subtitleVtt = chunksToVtt(chunks);
+      }
       subChunkCount = chunks.length;
+      if (!subtitleSrt.trim()) {
+        throw new Error('SRT 內容為空，字幕產生失敗');
+      }
       setProgress(mergeRangeStart, '開始合併影片…');
     }
 
@@ -948,21 +995,35 @@ async function runMerge() {
 
       if (els.resultTrack && lastVttUrl) {
         els.resultTrack.hidden = false;
-        els.resultTrack.src = lastVttUrl;
+        els.resultTrack.removeAttribute('hidden');
+        els.resultTrack.kind = 'subtitles';
+        els.resultTrack.label = '自動字幕';
+        els.resultTrack.srclang = 'zh';
         els.resultTrack.default = true;
-        // Re-load so track attaches
+        els.resultTrack.src = lastVttUrl;
+        // Re-load so track attaches, then force mode=showing
         els.resultVideo.load();
         els.resultVideo.src = resultUrl;
+        enableSubtitleTrack();
       }
 
       els.subsResultHint.hidden = false;
       els.subsResultHint.textContent = subtitlesEmbedded
-        ? `已產生 ${subChunkCount} 句字幕並嘗試嵌入影片；可按「下載 SRT 字幕」。預覽請開啟播放器字幕。`
-        : `已產生 ${subChunkCount} 句字幕；可按「下載 SRT 字幕」（預覽使用 WebVTT）。`;
+        ? `已產生 ${subChunkCount} 句字幕並嵌入影片；可下載 SRT。下方可核對辨識文字。`
+        : `已產生 ${subChunkCount} 句字幕（嵌入影片可能失敗，請下載 SRT 或看下方預覽／播放器 CC）。`;
+
+      if (els.subsPreview && els.subsPreviewBody) {
+        els.subsPreview.hidden = false;
+        // Show first ~30 lines of SRT for verification
+        const preview = lastSrtText.split('\n').slice(0, 60).join('\n');
+        els.subsPreviewBody.textContent =
+          preview + (lastSrtText.split('\n').length > 60 ? '\n…' : '');
+      }
     } else {
       lastSrtText = null;
       lastSrtFilename = null;
       setSrtDownloadVisible(false);
+      if (els.subsPreview) els.subsPreview.hidden = true;
     }
 
     els.resultBlock.classList.add('is-visible');

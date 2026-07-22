@@ -963,6 +963,38 @@ body {
   display: none !important;
 }
 
+.subs-preview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.subs-preview[hidden] {
+  display: none !important;
+}
+
+.subs-preview-head {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.subs-preview-body {
+  margin: 0;
+  max-height: 12rem;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .result-video {
   width: 100%;
   max-height: 360px;
