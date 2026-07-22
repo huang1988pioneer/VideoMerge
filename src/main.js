@@ -393,6 +393,13 @@ async function runMerge() {
   setProgress(0, '載入 FFmpeg…');
 
   try {
+    // Re-check files still readable before heavy work
+    for (const clip of ready) {
+      if (!(clip.file instanceof File) || clip.file.size <= 0) {
+        throw new Error(`檔案無效或為空：${clip.name}`);
+      }
+    }
+
     const blob = await mergeVideos(
       ready.map((c) => c.file),
       {
