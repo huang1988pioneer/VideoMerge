@@ -519,9 +519,20 @@ function estimateOutputDurationSec() {
   return base;
 }
 
+/** Monotonic progress so bar never jumps backward mid-job */
+let progressFloor = 0;
+
+function resetProgressFloor() {
+  progressFloor = 0;
+}
+
 function setProgress(ratio, status) {
   if (typeof ratio === 'number' && Number.isFinite(ratio)) {
-    const pct = Math.max(0, Math.min(100, Math.round(ratio * 100)));
+    const clamped = Math.max(0, Math.min(1, ratio));
+    // Explicit 0 resets (job start / failure); otherwise never go backwards
+    if (clamped === 0) progressFloor = 0;
+    else progressFloor = Math.max(progressFloor, clamped);
+    const pct = Math.round(progressFloor * 100);
     els.progressFill.style.width = `${pct}%`;
     els.progressPct.textContent = `${pct}%`;
     els.progressBar.setAttribute('aria-valuenow', String(pct));
@@ -756,6 +767,7 @@ async function runMerge() {
   els.progressBlock.classList.add('is-visible');
   els.logBox.hidden = false;
   els.logBox.textContent = '';
+  resetProgressFloor();
   setProgress(0, '載入 FFmpeg…');
 
   try {
@@ -795,15 +807,18 @@ async function runMerge() {
     let subtitleVtt = null;
     let subChunkCount = 0;
 
+    // ASR occupies 0–22% of bar; FFmpeg merge uses remaining 22–100%
+    const mergeRangeStart = wantSubs ? 0.22 : 0;
+
     if (wantSubs) {
-      setProgress(0.05, '語音辨識中…');
+      setProgress(0.02, '語音辨識中…');
       const lang = els.subLang.value || 'chinese';
       const asr = await transcribeAudioToSubtitles(bgm, {
         language: lang === 'auto' ? null : lang,
         onStatus: (s) => setProgress(undefined, s),
         onProgress: (p) => {
           if (typeof p === 'number' && Number.isFinite(p)) {
-            setProgress(Math.min(0.35, p * 0.35), els.progressStatus.textContent);
+            setProgress(0.02 + Math.min(1, Math.max(0, p)) * 0.18, els.progressStatus.textContent);
           }
         },
         onLog: (msg) => appendLog(msg),
@@ -826,8 +841,12 @@ async function runMerge() {
       subtitleSrt = chunksToSrt(chunks);
       subtitleVtt = chunksToVtt(chunks);
       subChunkCount = chunks.length;
-      setProgress(0.4, '開始合併影片…');
+      setProgress(mergeRangeStart, '開始合併影片…');
     }
+
+    const clipDurations = ready.map((c) =>
+      Number.isFinite(c.duration) && c.duration > 0 ? c.duration : 10,
+    );
 
     const { blob, subtitlesEmbedded } = await mergeVideos(
       ready.map((c) => c.file),
@@ -835,13 +854,14 @@ async function runMerge() {
         noAudio,
         audioFile: bgm,
         subtitleSrt,
+        clipDurations,
         loop,
         onStatus: (s) => setProgress(undefined, s),
         onProgress: (p) => {
           if (typeof p === 'number' && Number.isFinite(p)) {
-            const base = wantSubs ? 0.4 : 0;
+            const local = Math.min(1, Math.max(0, p));
             setProgress(
-              Math.min(0.99, base + p * (1 - base)),
+              mergeRangeStart + local * (1 - mergeRangeStart),
               els.progressStatus.textContent,
             );
           }

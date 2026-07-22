@@ -3,6 +3,12 @@ import { toBlobURL } from '@ffmpeg/util';
 
 let ffmpeg = null;
 let loadPromise = null;
+/** Single progress listener flag per FFmpeg instance */
+let progressListenerBound = false;
+/** @type {null | ((ev: { progress?: number, time?: number }) => void)} */
+let activeProgressSink = null;
+/** @type {null | ((msg: string) => void)} */
+let activeLogSink = null;
 
 /** Prefer esm for Vite (per ffmpeg.wasm docs). Multiple CDNs for reliability. */
 const CORE_CANDIDATES = [
@@ -45,14 +51,30 @@ async function readBytes(file) {
 }
 
 /**
+ * Bind log/progress once; route via active sinks so handlers never stack.
+ * @param {FFmpeg} instance
+ */
+function bindInstanceEvents(instance) {
+  if (progressListenerBound) return;
+  instance.on('log', ({ message }) => {
+    activeLogSink?.(message);
+  });
+  instance.on('progress', (ev) => {
+    activeProgressSink?.(ev);
+  });
+  progressListenerBound = true;
+}
+
+/**
  * @param {string} base
  * @param {(msg: string) => void} [onLog]
- * @param {(ratio: number) => void} [onProgress]
  */
-async function loadFromBase(base, onLog, onProgress) {
+async function loadFromBase(base, onLog) {
+  // New instance → rebind allowed
+  progressListenerBound = false;
   const instance = new FFmpeg();
-  if (onLog) instance.on('log', ({ message }) => onLog(message));
-  if (onProgress) instance.on('progress', ({ progress }) => onProgress(progress));
+  activeLogSink = onLog || null;
+  bindInstanceEvents(instance);
 
   const coreURL = await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript');
   const wasmURL = await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm');
@@ -63,12 +85,11 @@ async function loadFromBase(base, onLog, onProgress) {
 /**
  * Lazy-load ffmpeg.wasm (single-thread core).
  * @param {(msg: string) => void} [onLog]
- * @param {(ratio: number) => void} [onProgress]
  */
-export async function ensureFFmpeg(onLog, onProgress) {
+export async function ensureFFmpeg(onLog) {
+  activeLogSink = onLog || null;
+
   if (ffmpeg?.loaded) {
-    if (onLog) ffmpeg.on('log', ({ message }) => onLog(message));
-    if (onProgress) ffmpeg.on('progress', ({ progress }) => onProgress(progress));
     return ffmpeg;
   }
 
@@ -79,7 +100,7 @@ export async function ensureFFmpeg(onLog, onProgress) {
     for (const base of CORE_CANDIDATES) {
       try {
         onLog?.(`載入 FFmpeg 核心：${base}`);
-        const instance = await loadFromBase(base, onLog, onProgress);
+        const instance = await loadFromBase(base, onLog);
         ffmpeg = instance;
         onLog?.('FFmpeg 載入完成');
         return instance;
@@ -110,16 +131,117 @@ function extFromName(name) {
 }
 
 /**
+ * Map ffmpeg progress event → local 0..1 using media time when possible.
+ * Raw `progress` often jumps to ~1 early on multi-step / loop jobs.
+ * @param {{ progress?: number, time?: number }} ev
+ * @param {number} [expectedSec]
+ */
+function localProgressFromEvent(ev, expectedSec) {
+  const timeUs = ev?.time;
+  if (
+    Number.isFinite(expectedSec) &&
+    expectedSec > 0 &&
+    typeof timeUs === 'number' &&
+    Number.isFinite(timeUs) &&
+    timeUs > 0
+  ) {
+    // ffmpeg.wasm reports time in microseconds
+    return Math.min(0.99, Math.max(0, timeUs / 1e6 / expectedSec));
+  }
+
+  const p = ev?.progress;
+  if (typeof p === 'number' && Number.isFinite(p) && p >= 0 && p <= 1) {
+    // Ignore values that already look "done" unless near end of expected — too noisy
+    return Math.min(0.99, Math.max(0, p));
+  }
+  return null;
+}
+
+/**
+ * Weighted multi-stage progress (overall never jumps to 99% on first short step).
+ * @param {{
+ *   onProgress?: (ratio: number) => void,
+ *   onStatus?: (status: string) => void,
+ * }} hooks
+ * @param {{ id: string, weight: number, label: string }[]} stages
+ */
+function createStageTracker(hooks, stages) {
+  const total = Math.max(
+    1e-6,
+    stages.reduce((s, st) => s + Math.max(0.01, st.weight), 0),
+  );
+  let index = 0;
+  let lastRatio = 0;
+
+  const emit = (local, label) => {
+    const safeLocal = Math.min(1, Math.max(0, local));
+    let done = 0;
+    for (let i = 0; i < index; i++) done += Math.max(0.01, stages[i].weight);
+    const curW = Math.max(0.01, stages[index]?.weight ?? 1);
+    // Cap in-stage at 0.98 so stage completion (1.0) is the only jump to stage end
+    const inStage = Math.min(0.98, safeLocal);
+    let ratio = (done + curW * inStage) / total;
+    ratio = Math.max(lastRatio, Math.min(0.99, ratio));
+    lastRatio = ratio;
+    hooks.onProgress?.(ratio);
+    if (label) hooks.onStatus?.(label);
+  };
+
+  return {
+    /** @param {string} id */
+    start(id) {
+      const i = stages.findIndex((s) => s.id === id);
+      if (i >= 0) index = i;
+      emit(0, stages[index]?.label);
+    },
+    /**
+     * @param {number} [local] 0..1 within current stage (omit to only refresh label)
+     * @param {string} [label]
+     */
+    update(local, label) {
+      if (typeof local === 'number' && Number.isFinite(local)) {
+        emit(local, label ?? stages[index]?.label);
+      } else if (label) {
+        hooks.onStatus?.(label);
+      }
+    },
+    /** Mark current stage complete and move on if needed */
+    complete() {
+      emit(1, stages[index]?.label);
+      if (index < stages.length - 1) index += 1;
+    },
+    finish() {
+      lastRatio = 1;
+      hooks.onProgress?.(1);
+      hooks.onStatus?.('完成');
+    },
+  };
+}
+
+/**
  * Run ffmpeg exec; throw with logs if non-zero.
  * @param {FFmpeg} ff
  * @param {string[]} args
  * @param {(msg: string) => void} [onLog]
+ * @param {{ expectedSec?: number, onLocal?: (r: number) => void }} [prog]
  */
-async function execOrThrow(ff, args, onLog) {
+async function execOrThrow(ff, args, onLog, prog = {}) {
+  const { expectedSec, onLocal } = prog;
   onLog?.(`$ ffmpeg ${args.join(' ')}`);
-  const code = await ff.exec(args);
-  if (code !== 0) {
-    throw new Error(`FFmpeg 結束代碼 ${code}（指令：ffmpeg ${args.join(' ')}）`);
+
+  activeProgressSink = (ev) => {
+    const local = localProgressFromEvent(ev, expectedSec);
+    if (local != null) onLocal?.(local);
+  };
+
+  try {
+    const code = await ff.exec(args);
+    if (code !== 0) {
+      throw new Error(`FFmpeg 結束代碼 ${code}（指令：ffmpeg ${args.join(' ')}）`);
+    }
+    onLocal?.(1);
+  } finally {
+    activeProgressSink = null;
   }
 }
 
@@ -128,10 +250,16 @@ async function execOrThrow(ff, args, onLog) {
  * @param {FFmpeg} ff
  * @param {string} input
  * @param {string} output
- * @param {{ noAudio?: boolean, onLog?: (msg: string) => void }} [opts]
+ * @param {{
+ *   noAudio?: boolean,
+ *   onLog?: (msg: string) => void,
+ *   expectedSec?: number,
+ *   onLocal?: (r: number) => void,
+ * }} [opts]
  */
 async function normalizeClip(ff, input, output, opts = {}) {
-  const { noAudio = false, onLog } = opts;
+  const { noAudio = false, onLog, expectedSec, onLocal } = opts;
+  const prog = { expectedSec, onLocal };
   const vf =
     'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p';
 
@@ -149,7 +277,7 @@ async function normalizeClip(ff, input, output, opts = {}) {
   ];
 
   if (noAudio) {
-    await execOrThrow(ff, [...videoArgs, '-an', '-y', output], onLog);
+    await execOrThrow(ff, [...videoArgs, '-an', '-y', output], onLog, prog);
     return;
   }
 
@@ -171,10 +299,11 @@ async function normalizeClip(ff, input, output, opts = {}) {
         output,
       ],
       onLog,
+      prog,
     );
   } catch (err) {
     onLog?.(`含音訊轉檔失敗，改為純影像：${err?.message || err}`);
-    await execOrThrow(ff, [...videoArgs, '-an', '-y', output], onLog);
+    await execOrThrow(ff, [...videoArgs, '-an', '-y', output], onLog, prog);
   }
 }
 
@@ -192,13 +321,22 @@ export const LOOP_LIMITS = {
  * @param {(msg: string) => void} [onLog]
  * @param {string[]} written
  */
-async function concatCopy(ff, names, output, onLog, written) {
+/**
+ * @param {FFmpeg} ff
+ * @param {string[]} names
+ * @param {string} output
+ * @param {(msg: string) => void} [onLog]
+ * @param {string[]} written
+ * @param {{ expectedSec?: number, onLocal?: (r: number) => void }} [prog]
+ */
+async function concatCopy(ff, names, output, onLog, written, prog = {}) {
   if (names.length === 1) {
     // Copy single file to output name via remux
     await execOrThrow(
       ff,
       ['-i', names[0], '-c', 'copy', '-movflags', '+faststart', '-y', output],
       onLog,
+      prog,
     );
     return;
   }
@@ -223,6 +361,7 @@ async function concatCopy(ff, names, output, onLog, written) {
       output,
     ],
     onLog,
+    prog,
   );
 }
 
@@ -277,10 +416,12 @@ function reencodeTailArgs(noAudio) {
  * @param {(msg: string) => void} [onLog]
  * @param {(status: string) => void} [onStatus]
  * @param {string[]} written
+ * @param {(r: number) => void} [onLocal]
  */
-async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
+async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written, onLocal) {
   const mode = loop?.mode || 'once';
   const noAudio = Boolean(loop?.noAudio);
+  const baseDur = Number(loop.baseDurationSec);
 
   if (mode === 'once') {
     if (baseName === 'output.mp4') return;
@@ -288,6 +429,7 @@ async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
       ff,
       ['-i', baseName, '-c', 'copy', '-movflags', '+faststart', '-y', 'output.mp4'],
       onLog,
+      { expectedSec: baseDur > 0 ? baseDur : undefined, onLocal },
     );
     return;
   }
@@ -302,16 +444,18 @@ async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
       await applyLoopExtend(
         ff,
         baseName,
-        { mode: 'once', noAudio },
+        { mode: 'once', noAudio, baseDurationSec: baseDur },
         onLog,
         onStatus,
         written,
+        onLocal,
       );
       return;
     }
 
+    const outSec = baseDur > 0 ? baseDur * count : undefined;
     onStatus?.(`循環延長：重複 ${count} 次…`);
-    onLog?.(`stream_loop extra=${count - 1}（總播放 ${count} 次）`);
+    onLog?.(`stream_loop extra=${count - 1}（總播放 ${count} 次，預估 ${outSec || '?'}s）`);
 
     try {
       // -stream_loop N means N additional loops (total plays = N+1)
@@ -330,11 +474,15 @@ async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
           'output.mp4',
         ],
         onLog,
+        { expectedSec: outSec, onLocal },
       );
     } catch (err) {
       onLog?.(`stream_loop 失敗，改用 concat 清單：${err?.message || err}`);
       const names = Array.from({ length: count }, () => baseName);
-      await concatCopy(ff, names, 'output.mp4', onLog, written);
+      await concatCopy(ff, names, 'output.mp4', onLog, written, {
+        expectedSec: outSec,
+        onLocal,
+      });
     }
     return;
   }
@@ -350,7 +498,6 @@ async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
       );
     }
 
-    const baseDur = Number(loop.baseDurationSec);
     if (Number.isFinite(baseDur) && baseDur > 0 && target <= baseDur + 0.05) {
       onStatus?.(`裁切至 ${target.toFixed(1)} 秒…`);
       await execOrThrow(
@@ -363,6 +510,7 @@ async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
           ...reencodeTailArgs(noAudio),
         ],
         onLog,
+        { expectedSec: target, onLocal },
       );
       return;
     }
@@ -383,6 +531,7 @@ async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
           ...reencodeTailArgs(noAudio),
         ],
         onLog,
+        { expectedSec: target, onLocal },
       );
     } catch (err) {
       onLog?.(`stream_loop 時長模式失敗，改用重複 concat：${err?.message || err}`);
@@ -395,12 +544,16 @@ async function applyLoopExtend(ff, baseName, loop, onLog, onStatus, written) {
       }
       const names = Array.from({ length: times }, () => baseName);
       const looped = 'looped_tmp.mp4';
-      await concatCopy(ff, names, looped, onLog, written);
+      await concatCopy(ff, names, looped, onLog, written, {
+        expectedSec: unit * times,
+        onLocal: (r) => onLocal?.(r * 0.5),
+      });
       written.push(looped);
       await execOrThrow(
         ff,
         ['-i', looped, '-t', target.toFixed(3), ...reencodeTailArgs(noAudio)],
         onLog,
+        { expectedSec: target, onLocal: (r) => onLocal?.(0.5 + r * 0.5) },
       );
     }
     return;
@@ -427,7 +580,15 @@ function formatSec(sec) {
  * @param {string} output
  * @param {(msg: string) => void} [onLog]
  */
-async function muxSubtitles(ff, videoName, srtName, output, onLog) {
+/**
+ * @param {FFmpeg} ff
+ * @param {string} videoName
+ * @param {string} srtName
+ * @param {string} output
+ * @param {(msg: string) => void} [onLog]
+ * @param {(r: number) => void} [onLocal]
+ */
+async function muxSubtitles(ff, videoName, srtName, output, onLog, onLocal) {
   await execOrThrow(
     ff,
     [
@@ -451,6 +612,7 @@ async function muxSubtitles(ff, videoName, srtName, output, onLog) {
       output,
     ],
     onLog,
+    { onLocal },
   );
 }
 
@@ -463,7 +625,15 @@ async function muxSubtitles(ff, videoName, srtName, output, onLog) {
  * @param {string} output
  * @param {(msg: string) => void} [onLog]
  */
-async function muxCustomAudio(ff, videoName, audioName, output, onLog) {
+/**
+ * @param {FFmpeg} ff
+ * @param {string} videoName
+ * @param {string} audioName
+ * @param {string} output
+ * @param {(msg: string) => void} [onLog]
+ * @param {{ expectedSec?: number, onLocal?: (r: number) => void }} [prog]
+ */
+async function muxCustomAudio(ff, videoName, audioName, output, onLog, prog = {}) {
   // Prefer looped audio + shortest (video ends first → clean length)
   try {
     await execOrThrow(
@@ -496,6 +666,7 @@ async function muxCustomAudio(ff, videoName, audioName, output, onLog) {
         output,
       ],
       onLog,
+      prog,
     );
     return;
   } catch (err) {
@@ -530,6 +701,7 @@ async function muxCustomAudio(ff, videoName, audioName, output, onLog) {
       output,
     ],
     onLog,
+    prog,
   );
 }
 
@@ -540,6 +712,7 @@ async function muxCustomAudio(ff, videoName, audioName, output, onLog) {
  *   noAudio?: boolean,
  *   audioFile?: File | null,
  *   subtitleSrt?: string | null,
+ *   clipDurations?: number[],
  *   loop?: {
  *     mode: 'once' | 'count' | 'duration',
  *     count?: number,
@@ -562,13 +735,73 @@ export async function mergeVideos(files, hooks = {}) {
     noAudio = false,
     audioFile = null,
     subtitleSrt = null,
+    clipDurations = [],
     loop = { mode: 'once' },
   } = hooks;
-  const ff = await ensureFFmpeg(onLog, onProgress);
+  const ff = await ensureFFmpeg(onLog);
 
   // Custom soundtrack replaces original audio; strip during normalize.
   const useCustomAudio = Boolean(audioFile) && !noAudio;
   const stripOriginalAudio = noAudio || useCustomAudio;
+  const needsLoop = loop?.mode && loop.mode !== 'once';
+
+  const durs = files.map((_, i) => {
+    const d = Number(clipDurations[i]);
+    return Number.isFinite(d) && d > 0 ? d : 10;
+  });
+  const baseDur =
+    Number(loop.baseDurationSec) > 0
+      ? Number(loop.baseDurationSec)
+      : durs.reduce((a, b) => a + b, 0);
+
+  let outDur = baseDur;
+  if (loop?.mode === 'count') {
+    outDur = baseDur * Math.max(1, Math.floor(Number(loop.count) || 1));
+  } else if (loop?.mode === 'duration') {
+    outDur = Math.max(0.1, Number(loop.targetSeconds) || baseDur);
+  }
+
+  // Weights ≈ encode cost (re-encode heavy; copy light)
+  /** @type {{ id: string, weight: number, label: string }[]} */
+  const stages = [{ id: 'write', weight: 3, label: '讀取並寫入暫存檔…' }];
+  for (let i = 0; i < files.length; i++) {
+    stages.push({
+      id: `norm${i}`,
+      weight: Math.max(8, durs[i]),
+      label: `標準化第 ${i + 1} / ${files.length} 段…`,
+    });
+  }
+  stages.push({
+    id: 'concat',
+    weight: 4,
+    label: files.length === 1 ? '準備基底片段…' : '串接片段…',
+  });
+  if (needsLoop) {
+    // Loop/re-encode is often the longest step (e.g. 1:01 → 2:50)
+    stages.push({
+      id: 'loop',
+      weight: Math.max(20, outDur * 1.5),
+      label:
+        loop.mode === 'count'
+          ? `循環延長：重複 ${loop.count} 次…`
+          : `循環延長並裁切至 ${formatSec(outDur)}…`,
+    });
+  } else {
+    stages.push({ id: 'export', weight: 3, label: '輸出中…' });
+  }
+  if (useCustomAudio) {
+    stages.push({
+      id: 'audio',
+      weight: Math.max(5, outDur * 0.25),
+      label: '套用自訂音軌（MP3）…',
+    });
+  }
+  if (subtitleSrt?.trim()) {
+    stages.push({ id: 'subs', weight: 3, label: '嵌入字幕…' });
+  }
+  stages.push({ id: 'read', weight: 2, label: '讀取結果…' });
+
+  const tracker = createStageTracker({ onProgress, onStatus }, stages);
 
   if (noAudio) onLog?.('選項：不要聲音（輸出無音軌）');
   if (useCustomAudio) {
@@ -578,17 +811,18 @@ export async function mergeVideos(files, hooks = {}) {
     onLog?.(
       `選項：延長模式=${loop.mode}` +
         (loop.mode === 'count' ? ` count=${loop.count}` : '') +
-        (loop.mode === 'duration' ? ` target=${loop.targetSeconds}s` : ''),
+        (loop.mode === 'duration' ? ` target=${loop.targetSeconds}s` : '') +
+        ` base≈${baseDur.toFixed(1)}s out≈${outDur.toFixed(1)}s`,
     );
   }
 
   const written = [];
   try {
-    onStatus?.('讀取並寫入暫存檔…');
+    tracker.start('write');
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const label = file?.name || `clip-${i}`;
-      onStatus?.(`讀取第 ${i + 1} / ${files.length} 段：${label}`);
+      tracker.update((i + 0.3) / (files.length + (useCustomAudio ? 1 : 0)), `讀取第 ${i + 1} / ${files.length} 段：${label}`);
       onLog?.(`讀取 ${label}（${file.size} bytes）…`);
 
       const bytes = await readBytes(file);
@@ -596,95 +830,115 @@ export async function mergeVideos(files, hooks = {}) {
       await ff.writeFile(name, bytes);
       written.push(name);
       onLog?.(`已寫入 MEMFS：${name}`);
+      tracker.update((i + 1) / (files.length + (useCustomAudio ? 1 : 0)));
     }
 
     let audioMemName = null;
     if (useCustomAudio) {
-      onStatus?.(`讀取音訊：${audioFile.name}`);
+      tracker.update(0.85, `讀取音訊：${audioFile.name}`);
       const audioBytes = await readBytes(audioFile);
       audioMemName = `bgm.${extFromName(audioFile.name) || 'mp3'}`;
       await ff.writeFile(audioMemName, audioBytes);
       written.push(audioMemName);
       onLog?.(`已寫入音訊：${audioMemName}（${audioFile.size} bytes）`);
     }
+    tracker.complete();
 
-    const needsLoop = loop?.mode && loop.mode !== 'once';
     const baseName = 'base.mp4';
 
     // 1) Normalize every input to shared format
     const normalized = [];
     const inputCount = files.length;
     for (let i = 0; i < inputCount; i++) {
-      onStatus?.(
-        `標準化第 ${i + 1} / ${inputCount} 段${stripOriginalAudio ? '（無原音）' : ''}…`,
-      );
+      tracker.start(`norm${i}`);
       const out = `norm${i}.mp4`;
       await normalizeClip(ff, written[i], out, {
         noAudio: stripOriginalAudio,
         onLog,
+        expectedSec: durs[i],
+        onLocal: (r) => tracker.update(r),
       });
       normalized.push(out);
       written.push(out);
+      tracker.complete();
     }
 
-    // 2) Build base sequence (one pass of all clips in order)
-    onStatus?.(normalized.length === 1 ? '準備基底片段…' : '串接片段…');
-    await concatCopy(ff, normalized, baseName, onLog, written);
+    // 2) Build base sequence
+    tracker.start('concat');
+    await concatCopy(ff, normalized, baseName, onLog, written, {
+      expectedSec: baseDur,
+      onLocal: (r) => tracker.update(r),
+    });
     written.push(baseName);
+    tracker.complete();
 
-    // 3) Optional loop / duration trim → video-only or with original audio
-    // When custom audio is used, keep video silent until mux step.
+    // 3) Optional loop / duration trim
     const videoOut = useCustomAudio ? 'video_only.mp4' : 'output.mp4';
     if (needsLoop) {
+      tracker.start('loop');
       await applyLoopExtend(
         ff,
         baseName,
-        { ...loop, noAudio: stripOriginalAudio },
+        { ...loop, noAudio: stripOriginalAudio, baseDurationSec: baseDur },
         onLog,
-        onStatus,
+        (s) => tracker.update(null, s),
         written,
+        (r) => tracker.update(r),
       );
       if (useCustomAudio) {
-        // applyLoopExtend always writes output.mp4 — rename for mux
         await execOrThrow(
           ff,
           ['-i', 'output.mp4', '-c', 'copy', '-y', videoOut],
           onLog,
+          { expectedSec: outDur, onLocal: (r) => tracker.update(0.95 + r * 0.05) },
         );
         written.push(videoOut);
       }
+      tracker.complete();
     } else {
-      onStatus?.(stripOriginalAudio ? '輸出影像中…' : '輸出中…');
+      tracker.start('export');
       await execOrThrow(
         ff,
         ['-i', baseName, '-c', 'copy', '-movflags', '+faststart', '-y', videoOut],
         onLog,
+        { expectedSec: baseDur, onLocal: (r) => tracker.update(r) },
       );
       written.push(videoOut);
+      tracker.complete();
     }
     if (!useCustomAudio) written.push('output.mp4');
 
-    // 4) Mux custom MP3 / audio as soundtrack
+    // 4) Mux custom audio
     let currentVideo = useCustomAudio ? videoOut : 'output.mp4';
     if (useCustomAudio && audioMemName) {
-      onStatus?.('套用自訂音軌（MP3）…');
-      await muxCustomAudio(ff, videoOut, audioMemName, 'output.mp4', onLog);
+      tracker.start('audio');
+      await muxCustomAudio(ff, videoOut, audioMemName, 'output.mp4', onLog, {
+        expectedSec: outDur,
+        onLocal: (r) => tracker.update(r),
+      });
       written.push('output.mp4');
       currentVideo = 'output.mp4';
+      tracker.complete();
     }
 
-    // 5) Soft-mux subtitles when provided
+    // 5) Soft-mux subtitles
     let subtitlesEmbedded = false;
     if (subtitleSrt && subtitleSrt.trim()) {
-      onStatus?.('嵌入字幕…');
+      tracker.start('subs');
       const srtName = 'subs.srt';
       await ff.writeFile(srtName, subtitleSrt);
       written.push(srtName);
       try {
         const withSubs = 'output_subs.mp4';
-        await muxSubtitles(ff, currentVideo, srtName, withSubs, onLog);
+        await muxSubtitles(
+          ff,
+          currentVideo,
+          srtName,
+          withSubs,
+          onLog,
+          (r) => tracker.update(r),
+        );
         written.push(withSubs);
-        // Replace output.mp4
         const subData = await ff.readFile(withSubs);
         await ff.writeFile('output.mp4', subData);
         currentVideo = 'output.mp4';
@@ -696,11 +950,15 @@ export async function mergeVideos(files, hooks = {}) {
         );
         subtitlesEmbedded = false;
       }
+      tracker.complete();
     }
 
-    onStatus?.('讀取結果…');
-    const data = await ff.readFile(currentVideo === 'output.mp4' ? 'output.mp4' : currentVideo);
+    tracker.start('read');
+    const data = await ff.readFile(
+      currentVideo === 'output.mp4' ? 'output.mp4' : currentVideo,
+    );
     if (!written.includes('output.mp4')) written.push('output.mp4');
+    tracker.finish();
 
     const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
     if (!u8.byteLength) {
@@ -711,6 +969,7 @@ export async function mergeVideos(files, hooks = {}) {
       subtitlesEmbedded,
     };
   } finally {
+    activeProgressSink = null;
     for (const name of written) {
       try {
         await ff.deleteFile(name);
