@@ -10,6 +10,8 @@ import {
   scriptToSubtitles,
   resolveSubtitleTimeline,
   shiftChunks,
+  detectAudioSpeechOnset,
+  computeAutoOffsetSec,
 } from './subtitle.js';
 
 /** @typedef {{
@@ -216,8 +218,12 @@ app.innerHTML = `
           placeholder="在此貼上語音稿（純文字）。也支援已有時間軸的 SRT / VTT，或 [00:01-00:03] 字幕 格式。&#10;&#10;範例：&#10;大家好，歡迎收看本期節目。&#10;今天我們來介紹影片合併功能。"
         ></textarea>
         <div class="script-sync-row">
+          <label class="opt-check" for="opt-auto-offset" title="依 MP3 開頭人聲自動計算字幕偏移">
+            <input type="checkbox" id="opt-auto-offset" checked />
+            <span>自動偏移</span>
+          </label>
           <label class="field field-inline" for="sub-offset" title="正數：字幕延後；負數：字幕提前">
-            <span class="field-label">字幕偏移（秒）</span>
+            <span class="field-label">手動偏移（秒）</span>
             <input
               type="number"
               id="sub-offset"
@@ -229,12 +235,12 @@ app.innerHTML = `
               inputmode="decimal"
             />
           </label>
-          <span class="field-hint script-sync-hint">
-            有 MP3 時以<strong>音軌一輪</strong>對齊稿件，影片較長會自動循環字幕；不同步可微調偏移。
+          <span class="field-hint script-sync-hint" id="offset-hint">
+            自動偏移會偵測 MP3 開頭人聲，再與第一句字幕對齊；可再加手動微調。
           </span>
         </div>
         <p class="field-hint">
-          純文字依標點／換行切句，並依語速比例對齊音軌（非整段影片硬切）。有時間軸的 SRT 最準。若同時勾選「自動辨識」，將優先使用語音稿。
+          純文字依標點／換行切句，並依語速比例對齊音軌。有時間軸的 SRT 最準。若同時勾選「自動辨識」，將優先使用語音稿。
         </p>
       </div>
     </section>
@@ -332,6 +338,8 @@ const els = {
   btnClearScript: document.getElementById('btn-clear-script'),
   scriptHint: document.getElementById('script-hint'),
   subOffset: document.getElementById('sub-offset'),
+  optAutoOffset: document.getElementById('opt-auto-offset'),
+  offsetHint: document.getElementById('offset-hint'),
   resultTrack: document.getElementById('result-track'),
   btnDownloadSrt: document.getElementById('btn-download-srt'),
   subsResultHint: document.getElementById('subs-result-hint'),
@@ -495,7 +503,23 @@ function syncAudioUI() {
   if (els.scriptText) els.scriptText.disabled = merging;
   if (els.btnLoadScript) els.btnLoadScript.disabled = merging;
   if (els.btnClearScript) els.btnClearScript.disabled = merging || !hasScript;
-  if (els.subOffset) els.subOffset.disabled = merging;
+  if (els.optAutoOffset) els.optAutoOffset.disabled = merging || !audioFile;
+  if (els.subOffset) {
+    // Manual offset always available as fine-tune (added on top of auto)
+    els.subOffset.disabled = merging;
+  }
+  if (els.offsetHint) {
+    if (!audioFile) {
+      els.offsetHint.textContent =
+        '自動偏移需要 MP3 音軌；僅影片時請用手動偏移微調。';
+    } else if (els.optAutoOffset?.checked) {
+      els.offsetHint.textContent =
+        '已開自動偏移：偵測 MP3 人聲起點對齊第一句；右側可再手動加減秒數。';
+    } else {
+      els.offsetHint.textContent =
+        '手動模式：正數延後字幕、負數提前。建議有 MP3 時勾選自動偏移。';
+    }
+  }
   if (els.scriptHint) {
     if (hasScript) {
       const n = els.scriptText.value.trim().length;
@@ -511,6 +535,47 @@ function syncAudioUI() {
 
 function getScriptText() {
   return (els.scriptText?.value || '').trim();
+}
+
+function getManualOffsetSec() {
+  const v = Number(els.subOffset?.value);
+  return Number.isFinite(v) ? v : 0;
+}
+
+/**
+ * Apply auto speech-onset offset (+ optional manual) to subtitle chunks.
+ * @param {import('./subtitle.js').SubChunk[] | { timestamp: [number, number], text: string }[]} chunks
+ * @param {File | null} bgm
+ * @param {number} totalDur
+ * @param {(msg: string) => void} [log]
+ */
+async function applySubtitleOffset(chunks, bgm, totalDur, log) {
+  let offset = getManualOffsetSec();
+  let autoPart = 0;
+
+  if (els.optAutoOffset?.checked && bgm) {
+    try {
+      setProgress(undefined, '偵測人聲起點（自動偏移）…');
+      const speech = await detectAudioSpeechOnset(bgm, log);
+      autoPart = computeAutoOffsetSec(chunks, speech.onsetSec);
+      offset += autoPart;
+      log?.(
+        `自動偏移：人聲@${speech.onsetSec.toFixed(2)}s 第一句@${(chunks[0]?.timestamp?.[0] ?? 0).toFixed(2)}s → auto ${autoPart >= 0 ? '+' : ''}${autoPart}s` +
+          (getManualOffsetSec() ? ` + 手動 ${getManualOffsetSec()}s` : '') +
+          ` = 合計 ${offset >= 0 ? '+' : ''}${offset.toFixed(2)}s`,
+      );
+      if (els.offsetHint) {
+        els.offsetHint.textContent = `上次自動偏移 ${autoPart >= 0 ? '+' : ''}${autoPart}s（人聲約 ${speech.onsetSec.toFixed(2)}s）`;
+      }
+    } catch (e) {
+      log?.(`自動偏移失敗，改用手動：${e?.message || e}`);
+    }
+  } else if (offset !== 0) {
+    log?.(`手動字幕偏移：${offset > 0 ? '+' : ''}${offset}s`);
+  }
+
+  if (Math.abs(offset) < 0.001) return chunks;
+  return shiftChunks(chunks, offset, totalDur);
 }
 
 function setAudioFile(file) {
@@ -1007,6 +1072,9 @@ async function runMerge() {
       const built = scriptToSubtitles(scriptRaw, timeline.cycleDur);
       let chunks = built.chunks;
 
+      // Offset against one cycle first, then tile (keeps sync on each audio loop)
+      chunks = await applySubtitleOffset(chunks, bgm, timeline.cycleDur, appendLog);
+
       // Tile when video is longer than one speech/audio cycle (matches looped MP3)
       if (
         timeline.totalDur > timeline.cycleDur + 0.25 &&
@@ -1016,13 +1084,6 @@ async function runMerge() {
         appendLog(
           `字幕循環對齊：${timeline.cycleDur.toFixed(1)}s → ${timeline.totalDur.toFixed(1)}s，句數 ${chunks.length}`,
         );
-      }
-
-      // User fine-tune offset (seconds): positive = delay subs
-      const offsetSec = Number(els.subOffset?.value);
-      if (Number.isFinite(offsetSec) && offsetSec !== 0) {
-        chunks = shiftChunks(chunks, offsetSec, timeline.totalDur);
-        appendLog(`字幕偏移：${offsetSec > 0 ? '+' : ''}${offsetSec}s`);
       }
 
       subtitleSrt = chunksToSrt(chunks);
@@ -1064,16 +1125,12 @@ async function runMerge() {
           audioDur,
           hasCustomAudio: true,
         });
+        chunks = await applySubtitleOffset(chunks, bgm, timeline.cycleDur, appendLog);
         if (timeline.totalDur > timeline.cycleDur + 0.25) {
           chunks = tileChunksToDuration(chunks, timeline.cycleDur, timeline.totalDur);
           appendLog(
             `字幕對齊：音訊 ${timeline.cycleDur.toFixed(1)}s → 影片 ${timeline.totalDur.toFixed(1)}s，句數 ${chunks.length}`,
           );
-        }
-        const offsetSec = Number(els.subOffset?.value);
-        if (Number.isFinite(offsetSec) && offsetSec !== 0) {
-          chunks = shiftChunks(chunks, offsetSec, timeline.totalDur);
-          appendLog(`字幕偏移：${offsetSec > 0 ? '+' : ''}${offsetSec}s`);
         }
       } catch (e) {
         appendLog(`字幕時長對齊略過：${e?.message || e}`);
@@ -1258,6 +1315,13 @@ els.optScriptSubs.addEventListener('change', () => {
     toast('請先貼上或上傳語音稿', 'error');
     // still allow check; merge will validate
     els.scriptText?.focus();
+  }
+  syncAudioUI();
+});
+
+els.optAutoOffset.addEventListener('change', () => {
+  if (els.optAutoOffset.checked && !audioFile) {
+    toast('自動偏移需要先選擇 MP3 音軌', 'error');
   }
   syncAudioUI();
 });

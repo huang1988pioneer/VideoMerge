@@ -453,6 +453,129 @@ export function parseTimedScript(raw) {
 }
 
 /**
+ * Detect when speech/energy starts in a mono waveform.
+ * @param {Float32Array} mono
+ * @param {number} sampleRate
+ * @param {{
+ *   frameMs?: number,
+ *   thresholdRatio?: number,
+ *   minRunFrames?: number,
+ * }} [opts]
+ * @returns {{ onsetSec: number, endSec: number, peakRms: number }}
+ */
+export function detectSpeechBounds(mono, sampleRate, opts = {}) {
+  const frameMs = opts.frameMs ?? 25;
+  const thresholdRatio = opts.thresholdRatio ?? 0.12;
+  const minRunFrames = opts.minRunFrames ?? 3;
+  const frameSize = Math.max(64, Math.floor((sampleRate * frameMs) / 1000));
+  const nFrames = Math.floor(mono.length / frameSize);
+  if (nFrames < 2) {
+    return { onsetSec: 0, endSec: mono.length / sampleRate, peakRms: 0 };
+  }
+
+  const rms = new Float32Array(nFrames);
+  let peak = 0;
+  for (let f = 0; f < nFrames; f++) {
+    let sum = 0;
+    const base = f * frameSize;
+    for (let i = 0; i < frameSize; i++) {
+      const v = mono[base + i];
+      sum += v * v;
+    }
+    const r = Math.sqrt(sum / frameSize);
+    rms[f] = r;
+    if (r > peak) peak = r;
+  }
+
+  // Noise floor: median of quieter half
+  const sorted = Array.from(rms).sort((a, b) => a - b);
+  const noise = sorted[Math.floor(sorted.length * 0.2)] || 0;
+  const thr = Math.max(peak * thresholdRatio, noise * 4, 0.008);
+
+  let onsetFrame = 0;
+  for (let f = 0; f < nFrames; f++) {
+    let ok = true;
+    for (let k = 0; k < minRunFrames; k++) {
+      if (f + k >= nFrames || rms[f + k] < thr) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      onsetFrame = f;
+      break;
+    }
+  }
+
+  let endFrame = nFrames - 1;
+  for (let f = nFrames - 1; f >= 0; f--) {
+    let ok = true;
+    for (let k = 0; k < minRunFrames; k++) {
+      if (f - k < 0 || rms[f - k] < thr) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      endFrame = f;
+      break;
+    }
+  }
+
+  const onsetSec = (onsetFrame * frameSize) / sampleRate;
+  const endSec = Math.min(
+    mono.length / sampleRate,
+    ((endFrame + 1) * frameSize) / sampleRate,
+  );
+  return { onsetSec, endSec, peakRms: peak };
+}
+
+/**
+ * Decode file and detect speech onset (seconds from start).
+ * @param {File | Blob} file
+ * @param {(msg: string) => void} [onLog]
+ * @returns {Promise<{ onsetSec: number, endSec: number, durationSec: number }>}
+ */
+export async function detectAudioSpeechOnset(file, onLog) {
+  const wave = await decodeAudioForWhisper(file, onLog);
+  // decodeAudioForWhisper returns 16k mono
+  const bounds = detectSpeechBounds(wave, SAMPLE_RATE);
+  const durationSec = wave.length / SAMPLE_RATE;
+  onLog?.(
+    `人聲起點≈${bounds.onsetSec.toFixed(2)}s · 終點≈${bounds.endSec.toFixed(2)}s · 峰值RMS=${bounds.peakRms.toFixed(4)}`,
+  );
+  return {
+    onsetSec: bounds.onsetSec,
+    endSec: bounds.endSec,
+    durationSec,
+  };
+}
+
+/**
+ * Auto subtitle offset so first cue aligns with detected speech onset.
+ * offset = speechOnset - firstCueStart  (positive → delay subtitles)
+ * @param {SubChunk[]} chunks
+ * @param {number} speechOnsetSec
+ * @param {{ clamp?: [number, number] }} [opts]
+ * @returns {number}
+ */
+export function computeAutoOffsetSec(chunks, speechOnsetSec, opts = {}) {
+  const [lo, hi] = opts.clamp || [-15, 15];
+  if (!chunks?.length) return 0;
+  const firstStart = Number(chunks[0].timestamp?.[0]) || 0;
+  const onset = Number(speechOnsetSec);
+  if (!Number.isFinite(onset)) return 0;
+  // Small bias: show subtitle ~80ms before perceived speech (reading comfort)
+  const bias = -0.08;
+  let delta = onset - firstStart + bias;
+  if (!Number.isFinite(delta)) return 0;
+  delta = Math.max(lo, Math.min(hi, delta));
+  // Ignore tiny jitter
+  if (Math.abs(delta) < 0.05) return 0;
+  return Math.round(delta * 100) / 100;
+}
+
+/**
  * Shift all cue times by delta seconds (can be negative). Clamps start >= 0.
  * @param {SubChunk[]} chunks
  * @param {number} deltaSec
