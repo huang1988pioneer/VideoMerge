@@ -11,6 +11,7 @@ import {
   scriptToSubtitlesFromSpeechStart,
   resolveSubtitleTimeline,
   shiftChunks,
+  shiftChunksFrom,
   detectAudioSpeechOnset,
   computeAutoOffsetSec,
 } from './subtitle.js';
@@ -44,6 +45,18 @@ let lastVttUrl = null;
 let lastSrtText = null;
 /** @type {string | null} */
 let lastSrtFilename = null;
+/** @type {{ timestamp: [number, number], text: string }[] | null} */
+let lastChunks = null;       // working chunks (may have preview offsets applied)
+let savedBaseChunks = null;  // pristine base — never modified, used to recompute from scratch
+/** @type {number} */
+let lastCycleDur = 0;
+/** @type {number} */
+let lastTotalDur = 0;
+/** Total global offset currently applied to all chunks in the preview (s) */
+let previewExtraOffset = 0;
+/** Partial-offset state: applied to chunks[previewPartialFrom:] on top of global offset */
+let previewPartialFrom = 0;   // 0-based chunk index where the partial shift begins
+let previewPartialDelta = 0;  // total partial delta currently baked into lastChunks
 
 const app = document.querySelector('#app');
 
@@ -296,7 +309,52 @@ app.innerHTML = `
           </div>
           <p class="field-hint" id="subs-result-hint" hidden></p>
           <div class="subs-preview" id="subs-preview" hidden>
-            <div class="subs-preview-head">辨識字幕預覽</div>
+            <div class="subs-preview-head">字幕預覽</div>
+            <div class="subs-adjust-row" id="subs-adjust-row">
+              <label class="field field-inline" for="subs-adjust-offset">
+                <span class="field-label">整體偏移（秒）</span>
+                <input
+                  type="number"
+                  id="subs-adjust-offset"
+                  class="field-select"
+                  value="0"
+                  step="0.1"
+                  min="-999"
+                  max="999"
+                  inputmode="decimal"
+                />
+              </label>
+              <button type="button" class="btn btn-ghost btn-sm" id="btn-subs-adjust">套用全體偏移</button>
+              <span class="field-hint subs-adjust-hint" id="subs-adjust-hint">正數＝字幕延後；負數＝字幕提前</span>
+            </div>
+            <div class="subs-adjust-row" id="subs-partial-row">
+              <span class="field-label" style="white-space:nowrap">從第</span>
+              <input
+                type="number"
+                id="subs-partial-from"
+                class="field-select"
+                value="1"
+                min="1"
+                step="1"
+                style="width:4.5rem"
+                inputmode="numeric"
+              />
+              <span class="field-label" style="white-space:nowrap">句起，再偏移</span>
+              <input
+                type="number"
+                id="subs-partial-offset"
+                class="field-select"
+                value="0"
+                step="0.1"
+                min="-999"
+                max="999"
+                style="width:5rem"
+                inputmode="decimal"
+              />
+              <span class="field-label">秒</span>
+              <button type="button" class="btn btn-ghost btn-sm" id="btn-subs-partial">套用區段偏移</button>
+              <span class="field-hint" id="subs-partial-hint">可在全體偏移之上，對後半段再細調</span>
+            </div>
             <pre class="subs-preview-body" id="subs-preview-body"></pre>
           </div>
         </div>
@@ -346,6 +404,15 @@ const els = {
   subsResultHint: document.getElementById('subs-result-hint'),
   subsPreview: document.getElementById('subs-preview'),
   subsPreviewBody: document.getElementById('subs-preview-body'),
+  subsAdjustRow: document.getElementById('subs-adjust-row'),
+  subsAdjustOffset: document.getElementById('subs-adjust-offset'),
+  btnSubsAdjust: document.getElementById('btn-subs-adjust'),
+  subsAdjustHint: document.getElementById('subs-adjust-hint'),
+  subsPartialRow: document.getElementById('subs-partial-row'),
+  subsPartialFrom: document.getElementById('subs-partial-from'),
+  subsPartialOffset: document.getElementById('subs-partial-offset'),
+  btnSubsPartial: document.getElementById('btn-subs-partial'),
+  subsPartialHint: document.getElementById('subs-partial-hint'),
   clipsRoot: document.getElementById('clips-root'),
   clipsCount: document.getElementById('clips-count'),
   progressBlock: document.getElementById('progress-block'),
@@ -702,6 +769,18 @@ function revokeResult() {
   }
   lastSrtText = null;
   lastSrtFilename = null;
+  lastChunks = null;
+  savedBaseChunks = null;
+  lastCycleDur = 0;
+  lastTotalDur = 0;
+  previewExtraOffset = 0;
+  previewPartialFrom = 0;
+  previewPartialDelta = 0;
+  if (els.subsAdjustOffset) els.subsAdjustOffset.value = '0';
+  if (els.subsAdjustHint) els.subsAdjustHint.textContent = '正數＝字幕延後；負數＝字幕提前';
+  if (els.subsPartialFrom) els.subsPartialFrom.value = '1';
+  if (els.subsPartialOffset) els.subsPartialOffset.value = '0';
+  if (els.subsPartialHint) els.subsPartialHint.textContent = '可在全體偏移之上，對後半段再細調';
   setSrtDownloadVisible(false);
   if (els.subsResultHint) {
     els.subsResultHint.hidden = true;
@@ -717,6 +796,122 @@ function revokeResult() {
   if (els.resultCollapsed) els.resultCollapsed.hidden = true;
   if (els.resultBody) els.resultBody.hidden = false;
   els.btnDownload.removeAttribute('href');
+}
+
+/**
+ * Recompute lastChunks from savedBaseChunks by applying:
+ *   1) global offset (previewExtraOffset) to all cues
+ *   2) partial offset (previewPartialDelta) to cues from previewPartialFrom onwards
+ * Then refresh VTT/SRT blobs and the live subtitle track.
+ * Does NOT re-merge the video — instant and non-destructive.
+ *
+ * @param {{ global?: number, partialFrom?: number, partialDelta?: number }} [overrides]
+ */
+async function recomputePreviewChunks(overrides = {}) {
+  if (!savedBaseChunks?.length) {
+    toast('目前沒有字幕可調整', 'error');
+    return;
+  }
+
+  // Resolve new values (fall back to current state)
+  const globalOff  = ('global'       in overrides) ? overrides.global       : previewExtraOffset;
+  const partFrom   = ('partialFrom'  in overrides) ? overrides.partialFrom  : previewPartialFrom;
+  const partDelta  = ('partialDelta' in overrides) ? overrides.partialDelta : previewPartialDelta;
+
+  // 1. Start from pristine base
+  const maxEnd = lastTotalDur || lastCycleDur || undefined;
+  let chunks = shiftChunks(savedBaseChunks, globalOff, maxEnd);
+
+  // 2. Apply partial offset on top
+  if (partDelta !== 0 && partFrom < chunks.length) {
+    chunks = shiftChunksFrom(chunks, partFrom, partDelta, maxEnd);
+  }
+
+  // 3. Persist new state
+  lastChunks = chunks;
+  previewExtraOffset = globalOff;
+  previewPartialFrom = partFrom;
+  previewPartialDelta = partDelta;
+
+  // 4. Tile when video is longer than one cycle
+  let displayChunks = lastChunks;
+  if (lastTotalDur > lastCycleDur + 0.25 && lastCycleDur > 0.2) {
+    displayChunks = tileChunksToDuration(lastChunks, lastCycleDur, lastTotalDur);
+  }
+
+  const newSrt = chunksToSrt(displayChunks);
+  const newVtt = chunksToVtt(displayChunks);
+  lastSrtText = newSrt;
+
+  if (lastSrtUrl) { URL.revokeObjectURL(lastSrtUrl); lastSrtUrl = null; }
+  if (lastVttUrl) { URL.revokeObjectURL(lastVttUrl); lastVttUrl = null; }
+
+  lastSrtUrl = URL.createObjectURL(
+    new Blob(['\uFEFF' + newSrt], { type: 'application/x-subrip;charset=utf-8' }),
+  );
+  lastVttUrl = URL.createObjectURL(
+    new Blob([newVtt], { type: 'text/vtt;charset=utf-8' }),
+  );
+
+  if (els.resultTrack && lastVttUrl) {
+    els.resultTrack.src = '';
+    setTimeout(() => {
+      els.resultTrack.src = lastVttUrl;
+      enableSubtitleTrack();
+    }, 50);
+  }
+
+  if (els.subsPreviewBody) {
+    const preview = newSrt.split('\n').slice(0, 60).join('\n');
+    els.subsPreviewBody.textContent = preview + (newSrt.split('\n').length > 60 ? '\n…' : '');
+  }
+}
+
+/**
+ * Apply global offset (shifts ALL cues).
+ * Reads value from #subs-adjust-offset.
+ */
+async function applyPreviewOffset() {
+  const inputDelta = Number(els.subsAdjustOffset?.value) || 0;
+  await recomputePreviewChunks({ global: inputDelta });
+
+  const sign = inputDelta >= 0 ? '+' : '';
+  const displayChunks = lastChunks || [];
+  if (els.subsAdjustHint) {
+    const firstSec = displayChunks[0]?.timestamp?.[0] ?? 0;
+    els.subsAdjustHint.textContent =
+      `已套用整體 ${sign}${inputDelta}s 偏移，第一句字幕在 ${firstSec.toFixed(2)}s`;
+  }
+  toast(`整體字幕偏移已更新（${sign}${inputDelta}s）`, 'success');
+}
+
+/**
+ * Apply partial offset starting from a specific sentence (1-indexed in UI).
+ * Reads values from #subs-partial-from and #subs-partial-offset.
+ */
+async function applyPartialOffset() {
+  if (!savedBaseChunks?.length) {
+    toast('目前沒有字幕可調整', 'error');
+    return;
+  }
+  const fromSentence = Math.max(1, Math.floor(Number(els.subsPartialFrom?.value) || 1));
+  const fromIdx = fromSentence - 1; // convert to 0-based
+  const delta = Number(els.subsPartialOffset?.value) || 0;
+
+  if (fromIdx >= savedBaseChunks.length) {
+    toast(`只有 ${savedBaseChunks.length} 句字幕，請輸入較小的句號`, 'error');
+    return;
+  }
+
+  await recomputePreviewChunks({ partialFrom: fromIdx, partialDelta: delta });
+
+  const sign = delta >= 0 ? '+' : '';
+  if (els.subsPartialHint) {
+    const pivotSec = (lastChunks?.[fromIdx]?.timestamp?.[0] ?? 0).toFixed(2);
+    els.subsPartialHint.textContent =
+      `第 ${fromSentence} 句起再 ${sign}${delta}s，該句字幕在 ${pivotSec}s`;
+  }
+  toast(`區段偏移已更新：第 ${fromSentence} 句起 ${sign}${delta}s`, 'success');
 }
 
 /**
@@ -1117,6 +1312,18 @@ async function runMerge() {
         );
       }
 
+      // Save pristine base for in-preview retiming (before tile so adjustments retile properly)
+      savedBaseChunks = chunks.map((c) => ({ timestamp: [...c.timestamp], text: c.text }));
+      lastChunks = savedBaseChunks.map((c) => ({ timestamp: [...c.timestamp], text: c.text }));
+      lastCycleDur = timeline.cycleDur;
+      lastTotalDur = timeline.totalDur;
+      previewExtraOffset = 0;
+      previewPartialFrom = 0;
+      previewPartialDelta = 0;
+      if (els.subsAdjustOffset) els.subsAdjustOffset.value = '0';
+      if (els.subsPartialFrom) els.subsPartialFrom.value = '1';
+      if (els.subsPartialOffset) els.subsPartialOffset.value = '0';
+
       // Tile when video is longer than one speech/audio cycle (matches looped MP3)
       if (
         timeline.totalDur > timeline.cycleDur + 0.25 &&
@@ -1168,6 +1375,17 @@ async function runMerge() {
           hasCustomAudio: true,
         });
         chunks = await applySubtitleOffset(chunks, bgm, timeline.cycleDur, appendLog);
+        // Save pristine base (pre-tile) chunks for in-preview retiming
+        savedBaseChunks = chunks.map((c) => ({ timestamp: [...c.timestamp], text: c.text }));
+        lastChunks = savedBaseChunks.map((c) => ({ timestamp: [...c.timestamp], text: c.text }));
+        lastCycleDur = timeline.cycleDur;
+        lastTotalDur = timeline.totalDur;
+        previewExtraOffset = 0;
+        previewPartialFrom = 0;
+        previewPartialDelta = 0;
+        if (els.subsAdjustOffset) els.subsAdjustOffset.value = '0';
+        if (els.subsPartialFrom) els.subsPartialFrom.value = '1';
+        if (els.subsPartialOffset) els.subsPartialOffset.value = '0';
         if (timeline.totalDur > timeline.cycleDur + 0.25) {
           chunks = tileChunksToDuration(chunks, timeline.cycleDur, timeline.totalDur);
           appendLog(
@@ -1176,6 +1394,17 @@ async function runMerge() {
         }
       } catch (e) {
         appendLog(`字幕時長對齊略過：${e?.message || e}`);
+        // Even without timeline, save chunks for possible retiming
+        savedBaseChunks = chunks.map((c) => ({ timestamp: [...c.timestamp], text: c.text }));
+        lastChunks = savedBaseChunks.map((c) => ({ timestamp: [...c.timestamp], text: c.text }));
+        lastCycleDur = 0;
+        lastTotalDur = 0;
+        previewExtraOffset = 0;
+        previewPartialFrom = 0;
+        previewPartialDelta = 0;
+        if (els.subsAdjustOffset) els.subsAdjustOffset.value = '0';
+        if (els.subsPartialFrom) els.subsPartialFrom.value = '1';
+        if (els.subsPartialOffset) els.subsPartialOffset.value = '0';
       }
 
       subtitleSrt = chunksToSrt(chunks);
@@ -1316,6 +1545,17 @@ els.btnClear.addEventListener('click', clearAll);
 els.btnMerge.addEventListener('click', runMerge);
 els.btnDismissResult.addEventListener('click', hideResultPreview);
 els.btnShowResult.addEventListener('click', showResultPreview);
+els.btnSubsAdjust?.addEventListener('click', () => applyPreviewOffset());
+els.subsAdjustOffset?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); applyPreviewOffset(); }
+});
+els.btnSubsPartial?.addEventListener('click', () => applyPartialOffset());
+els.subsPartialOffset?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); applyPartialOffset(); }
+});
+els.subsPartialFrom?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); applyPartialOffset(); }
+});
 els.btnDownloadSrt.addEventListener('click', (e) => {
   e.preventDefault();
   downloadSrt();

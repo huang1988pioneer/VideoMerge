@@ -626,8 +626,12 @@ function smoothFrames(src, halfWin) {
  * clear energy rise into the song body — NOT raw mid-band RMS at 0:00, and
  * NOT vocal-ratio alone (mid-heavy mixes often keep ratio high through intros).
  *
- * Validated against long soft-intro Chinese songs where old thr (noise×8)
- * exceeded peak and fell back to ~1.5s false onset.
+ * v2 improvements:
+ *  - Per-frame vocalRatio (vocRms/fullRms) used in scoring and intro detection.
+ *  - hasQuietIntro also fires when early vocalRatio is low (beat intro with no voice).
+ *  - Candidate scoring includes a vocalRatio-rise bonus.
+ *  - Earliest candidate undergoes a 1.5s persistence check to reject drum hits.
+ *  - Safety guard extended from 1.2s to 1.5s.
  *
  * @param {Float32Array} mono full-band
  * @param {Float32Array} vocal mono vocal-filtered
@@ -644,6 +648,8 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
 
   const fullRms = new Float32Array(nFrames);
   const vocRms = new Float32Array(nFrames);
+  /** Ratio of vocal-band energy to full-band energy per frame */
+  const vocalRatio = new Float32Array(nFrames);
   let peakV = 0;
   let peakF = 0;
 
@@ -659,41 +665,56 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
     }
     fullRms[f] = Math.sqrt(sf / frameSize);
     vocRms[f] = Math.sqrt(sv / frameSize);
+    // vocalRatio: how much of the energy is in the vocal band
+    vocalRatio[f] = fullRms[f] > 1e-6 ? vocRms[f] / fullRms[f] : 0;
     if (vocRms[f] > peakV) peakV = vocRms[f];
     if (fullRms[f] > peakF) peakF = fullRms[f];
   }
 
-  // ~±200ms smooth — reject single drum hits but keep phrase onsets
+  // ~200ms smooth — reject single drum hits but keep phrase onsets
   const halfWin = Math.max(2, Math.round(200 / frameMs));
   const smF = smoothFrames(fullRms, halfWin);
   const smV = smoothFrames(vocRms, halfWin);
+  const smR = smoothFrames(vocalRatio, halfWin); // smoothed vocal ratio
 
   const sortedF = Array.from(smF).sort((a, b) => a - b);
   const sortedV = Array.from(smV).sort((a, b) => a - b);
+  const sortedR = Array.from(smR).sort((a, b) => a - b);
   const p20F = sortedF[Math.floor(nFrames * 0.2)] || 0;
   const p50F = sortedF[Math.floor(nFrames * 0.5)] || 0;
-  const p80F = sortedF[Math.floor(nFrames * 0.8)] || peakF;
   const p90F = sortedF[Math.floor(nFrames * 0.9)] || peakF;
   const p50V = sortedV[Math.floor(nFrames * 0.5)] || 0;
   const p80V = sortedV[Math.floor(nFrames * 0.8)] || peakV;
   const noiseV = sortedV[Math.floor(nFrames * 0.25)] || 0;
+  // Global median vocal ratio — body sections (with voice) tend to lift this above intro
+  const medianR = sortedR[Math.floor(nFrames * 0.5)] || 0;
 
-  // --- Quiet intro? (soft pad / sparse notes, then loud body) ---
+  // --- Quiet intro / beat-intro detection ---
   const introProbeSec = Math.min(10, Math.max(4, durationSec * 0.12));
   const introFrames = Math.max(1, Math.floor(introProbeSec / hopSec));
   let earlySum = 0;
+  let earlyVRatioSum = 0;
   let earlyN = 0;
   for (let f = 0; f < Math.min(introFrames, nFrames); f++) {
     earlySum += smF[f];
+    earlyVRatioSum += smR[f];
     earlyN += 1;
   }
   const earlyAvg = earlyN ? earlySum / earlyN : 0;
+  const earlyVocalRatio = earlyN ? earlyVRatioSum / earlyN : 0;
+
+  // Quiet intro: energy criterion (classic) OR vocal-ratio-low criterion (v2).
+  // The second branch catches "beat intro" tracks: drums/pads are audible, so
+  // earlyAvg is moderate, but voice hasn't entered yet (earlyVocalRatio is low).
   const hasQuietIntro =
     durationSec > 8 &&
     earlyAvg > 1e-5 &&
-    earlyAvg < p50F * 0.62 &&
-    p90F > earlyAvg * 1.75 &&
-    p90F > peakF * 0.35;
+    (
+      // Classic: full-band energy well below the median song body
+      (earlyAvg < p50F * 0.72 && p90F > earlyAvg * 1.75 && p90F > peakF * 0.35) ||
+      // Beat intro: energy moderate, but vocal-band ratio is clearly below the body
+      (earlyVocalRatio < Math.max(medianR * 0.45, 0.3) && medianR > 0.28 && durationSec > 12)
+    );
 
   // Body threshold relative to intro when quiet; else absolute energy
   let bodyThrF = hasQuietIntro
@@ -707,37 +728,74 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
     : Math.max(peakV * 0.18, p50V * 0.8, noiseV * 3, 0.008);
   bodyThrV = Math.min(bodyThrV, peakV * 0.55 || bodyThrV);
 
+  // Vocal ratio threshold — above this level strongly suggests voice is present
+  const ratioThr = Math.max(medianR * 0.55, earlyVocalRatio * 1.6, 0.32);
+
   // Phrase onset can be short (~350ms); don't require full chorus sustain
   const runFrames = Math.max(5, Math.round(0.35 / hopSec));
   const lookback = Math.max(8, Math.round(1.4 / hopSec));
+  // Persistence window for candidacy validation (~1.5s post-onset)
+  const persistFrames = Math.max(8, Math.round(1.5 / hopSec));
 
   /**
    * @param {number} f
-   * @returns {{ ok: boolean, rise: number, prev: number, cur: number, midOk: number }}
+   * @returns {{ ok: boolean, rise: number, prev: number, cur: number, midOk: number, ratioOk: number, ratioRise: number, curR: number }}
    */
   const evalOnset = (f) => {
     let okF = 0;
     let midOk = 0;
+    let ratioOk = 0;
     for (let k = 0; k < runFrames; k++) {
       const i = f + k;
       if (i >= nFrames) break;
       if (smF[i] >= bodyThrF) okF += 1;
       if (smV[i] >= bodyThrV * 0.85) midOk += 1;
+      if (smR[i] >= ratioThr) ratioOk += 1;
     }
     let prev = 0;
+    let prevR = 0;
     let c = 0;
     for (let i = Math.max(0, f - lookback); i < f; i++) {
       prev += smF[i];
+      prevR += smR[i];
       c += 1;
     }
     prev = c ? prev / c : smF[f];
+    prevR = c ? prevR / c : smR[f];
     const cur = smF[f];
+    const curR = smR[f];
     const rise = cur / Math.max(prev, 1e-6);
+    // Vocal ratio rise: how much the ratio lifted relative to the lookback average
+    const ratioRise = curR / Math.max(prevR, 0.05);
     const ok =
       okF >= runFrames * 0.72 &&
-      // need either mid-band presence or strong full-band (some mixes duck mids)
-      (midOk >= runFrames * 0.4 || cur >= bodyThrF * 1.05);
-    return { ok, rise, prev, cur, midOk };
+      // need either mid-band presence, strong full-band, or rising vocal ratio
+      (midOk >= runFrames * 0.4 || cur >= bodyThrF * 1.05 || ratioOk >= runFrames * 0.5);
+    return { ok, rise, prev, cur, midOk, ratioOk, ratioRise, curR };
+  };
+
+  /**
+   * Verify that a candidate onset sustains for ~1.5s (rejects drum transients).
+   * Returns true if energy + vocal ratio are maintained for 60% of the window.
+   * @param {number} f
+   */
+  const isPersistent = (f) => {
+    if (f + persistFrames >= nFrames) return true; // near end — accept
+    const sustainThr = bodyThrF * 0.65;
+    const ratioHoldThr = ratioThr * 0.75;
+    let energyOk = 0;
+    let ratioOk = 0;
+    for (let k = 0; k < persistFrames; k++) {
+      const i = f + k;
+      if (i >= nFrames) break;
+      if (smF[i] >= sustainThr) energyOk += 1;
+      if (smR[i] >= ratioHoldThr) ratioOk += 1;
+    }
+    // Accept if energy is sustained, OR combined energy + vocal-ratio evidence
+    return (
+      energyOk >= persistFrames * 0.6 ||
+      (energyOk >= persistFrames * 0.45 && ratioOk >= persistFrames * 0.4)
+    );
   };
 
   /** @type {{ frame: number, t: number, score: number, rise: number }[]} */
@@ -751,7 +809,9 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
       if (e.rise < 1.45 && e.prev > bodyThrF * 0.72) continue;
       if (e.cur < bodyThrF * 0.95) continue;
     }
-    const score = e.cur * (0.55 + Math.min(2.8, e.rise) * 0.45);
+    // Score: energy × (rise factor) + vocal-ratio bonus (capped at 25% of total)
+    const ratioBonus = Math.min(0.25, (e.ratioRise - 1) * 0.15 + (e.curR > ratioThr ? 0.10 : 0));
+    const score = e.cur * (0.55 + Math.min(2.8, e.rise) * 0.30 + ratioBonus);
     riseCandidates.push({
       frame: f,
       t: f * hopSec,
@@ -769,14 +829,23 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
   if (riseCandidates.length) {
     // Prefer earliest solid entry — not chorus peak later in the song
     const best = Math.max(...riseCandidates.map((c) => c.score));
-    // Lower bar (0.38) so first verse wins over later louder chorus
+    // Slightly tighter bar (0.42 vs old 0.38) to keep quality candidates
     const good = riseCandidates
-      .filter((c) => c.score >= best * 0.38)
+      .filter((c) => c.score >= best * 0.42)
       .sort((a, b) => a.frame - b.frame);
-    onsetFrame = good[0].frame;
+
+    // Walk from earliest to find first persistent onset (not just a drum transient)
+    let chosen = good[0];
+    for (const cand of good) {
+      if (isPersistent(cand.frame)) {
+        chosen = cand;
+        break;
+      }
+    }
+    onsetFrame = chosen.frame;
     method = hasQuietIntro ? 'energy-rise-after-intro' : 'energy-body';
     if (hasQuietIntro) {
-      introSec = Math.max(0, good[0].t - 0.15);
+      introSec = Math.max(0, chosen.t - 0.15);
     }
   }
 
@@ -819,14 +888,14 @@ function detectVocalOnsetFromBands(mono, vocal, sampleRate) {
 
   let onsetSec = onsetFrame * hopSec;
 
-  // Never trust near-zero on quiet-intro music beds
-  if (hasQuietIntro && onsetSec < 1.2 && riseCandidates.length > 1) {
-    const later = riseCandidates.find((c) => c.t >= 1.5);
-    if (later) {
+  // Never trust near-zero on quiet/beat-intro music beds (guard extended to 1.5s)
+  if (hasQuietIntro && onsetSec < 1.5 && riseCandidates.length > 1) {
+    const later = riseCandidates.find((c) => c.t >= 1.8);
+    if (later && isPersistent(later.frame)) {
       onsetFrame = later.frame;
       onsetSec = later.t;
       method = 'energy-skip-false-zero';
-      introSec = Math.max(introSec, 1.2);
+      introSec = Math.max(introSec, 1.5);
     }
   }
 
@@ -880,9 +949,9 @@ export async function detectAudioSpeechOnset(file, onLog) {
 
   let bounds = detectVocalOnsetFromBands(wave, vocal, SAMPLE_RATE);
 
-  // Safety net: never hard-snap soft intros to 1.5s (old bug). If onset is
-  // still near zero on a long track, look for a real quiet→loud step after 2s.
-  if (durationSec > 12 && bounds.onsetSec < 0.8) {
+  // Safety net (v2: extended to 1.5s). If onset is still too early on a long
+  // track, look for a real quiet→loud energy step beyond 2s.
+  if (durationSec > 10 && bounds.onsetSec < 1.5) {
     const frameMs = 50;
     const frameSize = Math.max(128, Math.floor((SAMPLE_RATE * frameMs) / 1000));
     const nFrames = Math.floor(wave.length / frameSize);
@@ -1078,6 +1147,46 @@ export function shiftChunks(chunks, deltaSec, maxEndSec) {
     }
     if (e <= s) e = s + 0.4;
     out.push({ timestamp: [s, e], text: c.text });
+  }
+  return out;
+}
+
+/**
+ * Shift cues from fromIdx (0-based) onwards by deltaSec; leave earlier cues unchanged.
+ * Useful for correcting drift in the latter half of a subtitle track without touching
+ * the cues that are already correctly timed.
+ *
+ * @param {SubChunk[]} chunks
+ * @param {number} fromIdx   0-based index of the first cue to shift
+ * @param {number} deltaSec  Seconds to add (negative = move earlier)
+ * @param {number} [maxEndSec]
+ * @returns {SubChunk[]}
+ */
+export function shiftChunksFrom(chunks, fromIdx, deltaSec, maxEndSec) {
+  const d = Number(deltaSec) || 0;
+  const from = Math.max(0, Math.floor(fromIdx));
+  /** @type {SubChunk[]} */
+  const out = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i];
+    if (i < from || !d) {
+      // Keep cues before the split point as-is (but still filter by maxEndSec)
+      if (Number.isFinite(maxEndSec) && c.timestamp[0] >= maxEndSec) continue;
+      out.push({ timestamp: [...c.timestamp], text: c.text });
+    } else {
+      let s = c.timestamp[0] + d;
+      let e = c.timestamp[1] + d;
+      if (Number.isFinite(maxEndSec)) {
+        if (s >= maxEndSec) continue;
+        e = Math.min(e, maxEndSec);
+      }
+      if (s < 0) {
+        e += -s;
+        s = 0;
+      }
+      if (e <= s) e = s + 0.4;
+      out.push({ timestamp: [s, e], text: c.text });
+    }
   }
   return out;
 }
