@@ -237,7 +237,7 @@ app.innerHTML = `
             />
           </label>
           <span class="field-hint script-sync-hint" id="offset-hint">
-            開唱通常不是 0:00；會略過前奏樂器，從歌聲起點再上字幕（可手動微調）。
+            開唱通常不是 0:00；會略過安靜前奏，偵測能量躍升（真正開唱）後再上字幕。
           </span>
         </div>
         <p class="field-hint">
