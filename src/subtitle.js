@@ -11,11 +11,11 @@ let loadedModelId = null;
 let loadPromise = null;
 
 const SAMPLE_RATE = 16000;
+const PREFERRED_MODEL_KEY = 'videomerge.whisper.model';
 
 /**
  * Prefer models/dtypes that work with current onnxruntime-web.
- * q8-only Whisper often fails with TransposeDQWeightsForMatMulNBits.
- * For Chinese speech, tiny is weak — include base as fallback after load.
+ * Browser Cache API keeps weights after first successful download.
  */
 const LOAD_CANDIDATES = [
   {
@@ -40,44 +40,101 @@ const LOAD_CANDIDATES = [
   },
 ];
 
+function getPreferredModelId() {
+  try {
+    return sessionStorage.getItem(PREFERRED_MODEL_KEY) || localStorage.getItem(PREFERRED_MODEL_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function setPreferredModelId(modelId) {
+  try {
+    sessionStorage.setItem(PREFERRED_MODEL_KEY, modelId);
+    localStorage.setItem(PREFERRED_MODEL_KEY, modelId);
+  } catch {
+    /* private mode etc. */
+  }
+}
+
+/**
+ * @param {{ preferBetterChinese?: boolean }} [opts]
+ */
+function buildCandidateOrder(opts = {}) {
+  const preferBase = Boolean(opts.preferBetterChinese);
+  const preferred = getPreferredModelId();
+  let order = [...LOAD_CANDIDATES];
+
+  if (preferBase) {
+    order = [
+      ...order.filter((c) => c.model.includes('base')),
+      ...order.filter((c) => !c.model.includes('base')),
+    ];
+  }
+
+  // Always try last successful model first (cached path)
+  if (preferred) {
+    order = [
+      ...order.filter((c) => c.model === preferred),
+      ...order.filter((c) => c.model !== preferred),
+    ];
+  }
+  return order;
+}
+
 /**
  * @param {(msg: string) => void} [onStatus]
  * @param {(ratio: number) => void} [onProgress]
  * @param {{ preferBetterChinese?: boolean }} [opts]
  */
 export async function ensureTranscriber(onStatus, onProgress, opts = {}) {
-  if (transcriber && loadedModelId) return transcriber;
+  // Same page session: model already in memory — no download
+  if (transcriber && loadedModelId) {
+    onStatus?.(`使用記憶體中的模型（${loadedModelId}，無需重新下載）`);
+    onProgress?.(1);
+    return transcriber;
+  }
   if (loadPromise) return loadPromise;
 
-  const preferBase = Boolean(opts.preferBetterChinese);
-  const order = preferBase
-    ? [
-        ...LOAD_CANDIDATES.filter((c) => c.model.includes('base')),
-        ...LOAD_CANDIDATES.filter((c) => !c.model.includes('base')),
-      ]
-    : LOAD_CANDIDATES;
+  const order = buildCandidateOrder(opts);
+  const preferred = getPreferredModelId();
 
   loadPromise = (async () => {
-    onStatus?.('載入語音辨識模型（首次約需下載，請保持網路連線）…');
+    onStatus?.(
+      preferred
+        ? '載入語音辨識模型（優先讀取瀏覽器快取，通常很快）…'
+        : '載入語音辨識模型（僅首次需下載，之後會快取）…',
+    );
     const { pipeline, env } = await import('@huggingface/transformers');
 
     env.allowLocalModels = false;
-    env.useBrowserCache = true;
+    env.useBrowserCache = true; // Cache API / IndexedDB — survives refresh
 
+    let sawNetworkProgress = false;
     const progress_callback = (p) => {
       if (p?.status === 'progress' && typeof p.progress === 'number') {
+        // Slow progress usually means real download; instant 100% often cache
+        if (p.progress < 100 && p.progress > 0) sawNetworkProgress = true;
         onProgress?.(Math.min(0.95, p.progress / 100));
         const name = p.file ? String(p.file).split('/').pop() : '';
-        onStatus?.(`下載模型：${name} ${Math.round(p.progress)}%`);
+        onStatus?.(
+          sawNetworkProgress
+            ? `下載模型：${name} ${Math.round(p.progress)}%（僅首次）`
+            : `讀取模型：${name} ${Math.round(p.progress)}%`,
+        );
       } else if (p?.status === 'done' && p.file) {
-        onStatus?.(`模型檔就緒：${String(p.file).split('/').pop()}`);
+        const name = String(p.file).split('/').pop();
+        onStatus?.(
+          sawNetworkProgress ? `已下載並快取：${name}` : `已從快取載入：${name}`,
+        );
       }
     };
 
     const errors = [];
     for (const candidate of order) {
       try {
-        onStatus?.(`嘗試載入：${candidate.label}…`);
+        onStatus?.(`載入：${candidate.label}…`);
+        const t0 = performance.now();
         const asr = await pipeline(
           'automatic-speech-recognition',
           candidate.model,
@@ -86,10 +143,16 @@ export async function ensureTranscriber(onStatus, onProgress, opts = {}) {
             progress_callback,
           },
         );
+        const ms = Math.round(performance.now() - t0);
         transcriber = asr;
         loadedModelId = candidate.model;
+        setPreferredModelId(candidate.model);
         onProgress?.(1);
-        onStatus?.(`語音辨識模型載入完成（${candidate.label}）`);
+        onStatus?.(
+          sawNetworkProgress || ms > 8000
+            ? `模型就緒（${candidate.label}，${(ms / 1000).toFixed(1)}s，已寫入快取，下次會更快）`
+            : `模型就緒（${candidate.label}，${(ms / 1000).toFixed(1)}s，多半來自快取）`,
+        );
         return asr;
       } catch (err) {
         const msg = err?.message || String(err);
@@ -101,7 +164,8 @@ export async function ensureTranscriber(onStatus, onProgress, opts = {}) {
     throw new Error(
       [
         '無法載入 Whisper 模型。',
-        '請確認網路可連到 Hugging Face，並用 Ctrl+F5 強制重新整理後再試。',
+        '請確認網路可連到 Hugging Face。',
+        '若曾清除網站資料，需重新下載一次。',
         errors.join(' | '),
       ].join(' '),
     );
